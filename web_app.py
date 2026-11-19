@@ -73,7 +73,7 @@ PAGE = r"""<!doctype html>
     <p>Your local companion for working in a separate browser window. Sign in there if needed; your browser session stays on this computer.</p>
   </header>
   <section class="card">
-    <h2>One-time setup</h2>
+    <h2>One-time setup (Go to https://groq.com -> API Keys -> Create API Key -> Copy it -> Paste it here)</h2>
     <form id="key-form">
       <label for="api-key">Groq API key</label>
       <div class="key-row">
@@ -86,7 +86,7 @@ PAGE = r"""<!doctype html>
   </section>
   <section class="card">
     <form id="start-form">
-      <label for="url">Assignment URL</label>
+      <label for="url">Assignment URL (Note - This will only work for MCQ's only)</label>
       <input id="url" name="url" type="url" placeholder="https://example.com/assignment" required>
       <p class="hint">The automation uses the local <code>browser_profile</code> and never uploads your browser session.</p>
       <label class="check">
