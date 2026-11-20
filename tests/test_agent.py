@@ -1,8 +1,12 @@
 import os
 import tempfile
+import threading
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import Mock, patch
+import httpx
+from groq import AuthenticationError
 from playwright.sync_api import Error as PlaywrightError
 
 from agent import (
@@ -13,6 +17,7 @@ from agent import (
     load_env_file,
     click_next_question,
     main,
+    run_automation,
     wait_for_question_state,
 )
 
@@ -149,6 +154,43 @@ class AgentHelperTests(unittest.TestCase):
         self.assertEqual(events[0]["live_view_url"], "https://debug.browserbase.com/live")
         browser.close.assert_called_once_with()
         playwright.stop.assert_called_once_with()
+
+    def test_rejected_groq_key_stops_without_retrying_or_waiting_for_close(self):
+        response = httpx.Response(
+            401,
+            request=httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
+        )
+        auth_error = AuthenticationError("Invalid API key", response=response, body=None)
+        page = Mock()
+        page.url = "https://example.test/assignment"
+        events = []
+
+        @contextmanager
+        def fake_browser_context(**kwargs):
+            yield object()
+
+        with patch("agent.Groq"), patch(
+            "agent.launch_browser_context", side_effect=fake_browser_context
+        ), patch("agent.get_active_page", return_value=page), patch(
+            "agent.get_open_page", return_value=page
+        ), patch(
+            "agent.wait_until_loaded", return_value=True
+        ), patch("agent.looks_like_login_page", return_value=False), patch(
+            "agent.wait_for_question_state",
+            return_value=("Question 1\nChoose one.", ["A"], []),
+        ), patch("agent.ask_groq", side_effect=auth_error) as ask_groq:
+            result = run_automation(
+                "https://example.test/assignment",
+                on_event=events.append,
+                close_event=threading.Event(),
+                keep_browser_open=True,
+                api_key="rejected-key",
+            )
+
+        self.assertEqual(result, "api_key_rejected")
+        self.assertEqual(ask_groq.call_count, 1)
+        self.assertIn("api_key_rejected", [event["status"] for event in events])
+        self.assertNotIn("awaiting_close", [event["status"] for event in events])
 
     @patch("agent.time.sleep")
     @patch("agent.sync_playwright")

@@ -97,8 +97,10 @@ PAGE = r"""<!doctype html>
     <form id="start-form">
       <div id="public-key-row" class="public-only">
         <label for="groq-key">Your Groq API key</label>
-        <input id="groq-key" name="groq-key" type="password" placeholder="Paste your Groq API key" autocomplete="off" autocapitalize="off" spellcheck="false">
-        <p class="hint">Sent over HTTPS for this run only; this website does not save it.</p>
+        <input id="groq-key" name="groq-key" type="text" placeholder="Paste your Groq API key" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <p class="hint">Your key is visible and saved in this browser only. It is sent over HTTPS for your run and is not stored by the server. Anyone using this same browser profile can see it.</p>
+        <p class="hint">Get a key: sign in to <a href="https://console.groq.com/keys" target="_blank" rel="noopener noreferrer">Groq API Keys</a>, choose <strong>Create API Key</strong>, then paste it here. To change it, replace the text below; it saves automatically.</p>
+        <p id="public-key-status" class="hint" role="status" aria-live="polite"></p>
       </div>
       <label for="url">Assignment URL (Note - This will only work for MCQ's only)</label>
       <input id="url" name="url" type="url" placeholder="https://example.com/assignment" required>
@@ -150,6 +152,7 @@ PAGE = r"""<!doctype html>
   const closeButton = document.querySelector("#close-browser");
   const publicKeyRow = document.querySelector("#public-key-row");
   const publicKeyInput = document.querySelector("#groq-key");
+  const publicKeyStatus = document.querySelector("#public-key-status");
   const browserViewCard = document.querySelector("#browser-view-card");
   const browserView = document.querySelector("#browser-view");
   const openBrowserView = document.querySelector("#open-browser-view");
@@ -161,12 +164,15 @@ PAGE = r"""<!doctype html>
   let lastLogCount = -1;
   let keyStatusEdited = false;
   let publicMode = false;
+  let publicKeyInitialized = false;
+  let lastState = null;
   const labels = {
     idle: "Idle", starting: "Starting", navigating: "Opening browser",
     login_required: "Sign in required", waiting: "Waiting",
     thinking: "Working", answer_set: "Answer set", advancing: "Advancing",
     retrying: "Retrying", warning: "Notice", awaiting_submission: "Ready for review",
     completed: "Finished", failed: "Error", needs_attention: "Needs attention",
+    api_key_rejected: "Groq key rejected",
     awaiting_close: "Browser open", closing_browser: "Closing browser",
     stopping: "Stopping", stopped: "Stopped"
   };
@@ -209,7 +215,6 @@ PAGE = r"""<!doctype html>
         auto_start: document.querySelector("#auto-start").checked,
         api_key: publicMode ? publicKeyInput.value : undefined
       });
-      if (publicMode) publicKeyInput.value = "";
       await refresh();
     } catch (error) {
       message.textContent = error.message;
@@ -244,6 +249,27 @@ PAGE = r"""<!doctype html>
       if (!response.ok) throw new Error(data.error || "Could not load session status.");
       publicMode = Boolean(data.public_mode);
       const state = data.state || "idle";
+      if (data.public_mode && !publicKeyInitialized) {
+        publicKeyInitialized = true;
+        try {
+          publicKeyInput.value = localStorage.getItem("quiz-assistant-groq-api-key") || "";
+          publicKeyStatus.textContent = publicKeyInput.value
+            ? "Your key is saved in this browser."
+            : "Paste your key once; it will be saved in this browser.";
+        } catch (error) {
+          publicKeyStatus.textContent = `Could not read the saved key from this browser: ${error.message}`;
+        }
+      }
+      if (state === "api_key_rejected" && lastState !== state) {
+        publicKeyInput.value = "";
+        try {
+          localStorage.removeItem("quiz-assistant-groq-api-key");
+          publicKeyStatus.textContent = "Groq rejected that key, so it was removed. Create a new key at Groq API Keys and paste it here.";
+        } catch (error) {
+          publicKeyStatus.textContent = `Groq rejected that key. Replace it above. Browser storage error: ${error.message}`;
+        }
+      }
+      lastState = state;
       const active = activeStates.has(state);
       stateLabel.textContent = labels[state] || state;
       badge.classList.toggle("active", active);
@@ -301,6 +327,21 @@ PAGE = r"""<!doctype html>
         : "Could not reach the local app. Check that web_app.py is still running.");
     }
   }
+
+  publicKeyInput.addEventListener("change", () => {
+    try {
+      publicKeyInput.value = publicKeyInput.value.trim();
+      if (publicKeyInput.value) {
+        localStorage.setItem("quiz-assistant-groq-api-key", publicKeyInput.value);
+        publicKeyStatus.textContent = "Saved in this browser.";
+      } else {
+        localStorage.removeItem("quiz-assistant-groq-api-key");
+        publicKeyStatus.textContent = "Saved key removed from this browser.";
+      }
+    } catch (error) {
+      publicKeyStatus.textContent = `Could not save the key in this browser: ${error.message}`;
+    }
+  });
 
   refresh();
   setInterval(refresh, 800);
@@ -417,6 +458,13 @@ class RunController:
                 api_key=api_key,
                 browser_context_id=browser_context_id,
             )
+            if result == "api_key_rejected":
+                self.report({
+                    "status": result,
+                    "message": "Groq rejected your API key. Replace it above; get a new key at https://console.groq.com/keys.",
+                    "live_view_url": "",
+                })
+                return
             self.report({
                 "status": result,
                 "message": f"Browser closed. Run ended: {result.replace('_', ' ')}.",

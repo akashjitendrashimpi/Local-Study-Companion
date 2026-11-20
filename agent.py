@@ -10,7 +10,7 @@ from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
-from groq import Groq
+from groq import AuthenticationError, Groq
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
@@ -926,6 +926,14 @@ def run_automation(
                     try:
                         decision = ask_groq(client, model_name, page_text, options, text_fields)
                         break
+                    except AuthenticationError:
+                        report(
+                            "api_key_rejected",
+                            "Groq rejected your API key. Replace the saved key above, then start again.",
+                            question_number,
+                        )
+                        terminal_status = "api_key_rejected"
+                        break
                     except Exception as exc:
                         if request_attempt == 2:
                             report("failed", f"Groq request failed after 3 tries: {exc}", question_number)
@@ -936,6 +944,8 @@ def run_automation(
 
                 if stop_event.is_set():
                     terminal_status = "stopped"
+                    break
+                if terminal_status == "api_key_rejected":
                     break
                 if decision is None:
                     break
@@ -1038,6 +1048,8 @@ def run_automation(
             elif terminal_status == "running":
                 terminal_status = "completed"
                 report("completed", "Reached the automation question limit.")
+            if terminal_status == "api_key_rejected":
+                return terminal_status
             if keep_browser_open and close_event:
                 if terminal_status == "awaiting_submission":
                     message = (
