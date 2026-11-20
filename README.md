@@ -1,42 +1,64 @@
-# Local Quiz Assistant
+# Local Study Companion
 
-This local web page starts the browser automation on this computer so it can use the existing `browser_profile`. The page binds only to `127.0.0.1`; it does not upload the browser profile or API key.
+A mobile-friendly web dashboard for the browser-based study assistant. Visitors create an account with a username, date of birth, and password. Dates display as `MM/DD/YYYY`; compact digit entries are formatted automatically, and the database stores canonical ISO dates. Sign-in remains active on that device until logout. Groq API keys are managed centrally by the administrator; visitors are never asked to provide one.
 
-## Setup
+## Run locally
 
-1. Install the Python packages:
+1. Install the dependencies and browser:
 
    ```powershell
    python -m pip install -r requirements.txt
    python -m playwright install chromium
    ```
 
-2. Start the local page from the project folder:
+2. Copy `.env.example` to `.env`. Set `APP_SECRET` to a random value of at least 32 characters and choose a strong `ADMIN_PASSWORD`. You can generate the secret with:
+
+   ```powershell
+   python -c "import secrets; print(secrets.token_urlsafe(32))"
+   ```
+
+3. Start the server:
 
    ```powershell
    python web_app.py
    ```
 
-   On Windows, you can also double-click `run.bat`.
+4. Sign in as `admin` (or the configured `ADMIN_USERNAME`), open **Admin**, and add Groq keys, one per line. Keys are encrypted in the database and are not displayed again. If a key is rejected or the Groq request fails, the current run tries another configured key before stopping.
 
-The page opens at `http://127.0.0.1:8765`. The first time, paste your Groq API key into the page and choose **Save key**. It is stored in the local `.env` file and stays there until you replace it. The key is not displayed again or included in activity logs. Keep `.env` private; it is ignored by Git.
+5. Visitors open the site, create an account, and use the assignment URL. Their browser automation session stays isolated. Runs stop before final submission; review and submit manually.
 
-Enter the assignment URL and press **Start**. The browser opens separately; sign in there if needed. By default, start the assignment manually in the browser. The optional automatic start may consume an attempt. The runner stops before final submission.
+The local database is stored under `APP_DATA_DIR` (default: `data`). Keep this directory private and back it up securely. Do not change `APP_SECRET` after adding encrypted API keys unless you first re-enter those keys.
 
-Use **Stop** in the page to request a safe stop. Model/API calls may take a few seconds to finish. The automation browser remains open for review; press **Close browser** in the page when you are done.
+## Supabase database
 
-The existing command-line entry point remains available with `python agent.py`. It waits at the end so you can review the assignment in Chrome and submit it yourself if ready; press ENTER in the terminal only when you want to close Chrome.
+For a hosted service with 100+ accounts, use a Supabase Postgres database rather than relying on a container's local SQLite file:
 
-The command-line runner and dashboard use the same `browser_profile`, so do not run them at the same time. To pick up code changes, stop an already-running dashboard with Ctrl+C and restart it with `python web_app.py`.
+1. Create a Supabase project and copy its Postgres connection string from **Connect**. Prefer the Supavisor pooler connection string for hosted app traffic.
+2. Set it as `SUPABASE_DATABASE_URL` in the server's environment (Render supports this in the service settings). Keep it secret; never put it in browser JavaScript or commit it to Git.
+3. Restart the service. The app creates its tables, enables row-level security, and revokes direct access for Supabase `anon` and `authenticated` roles. The app accesses data only through its server-side database connection.
 
-## Deploy on Render
+When `SUPABASE_DATABASE_URL` is set, accounts, DOB, salted password hashes, sessions, and encrypted API keys are stored in Supabase. The companion app handles username/password authentication server-side; it does not store or expose readable passwords. Without the URL, local SQLite remains available. Admins can view usernames, DOB, and account creation dates, and replace a password; they cannot retrieve the existing one. Password reset revokes the user's existing sessions.
 
-The app can be hosted with Render's Docker service:
+Switching an existing installation from SQLite to Supabase does not copy its existing accounts or keys automatically. Back up the SQLite database and arrange a one-time migration before switching if it already contains data.
 
-1. Push this repository to GitHub.
-2. In Render, create a new Web Service from the repository.
-3. Select **Docker** as the runtime.
-4. In Render's environment settings, set `BROWSERBASE_API_KEY` from your Browserbase account and `APP_SECRET`. Generate the secret locally with `python -c "import secrets; print(secrets.token_urlsafe(32))"`; do not share it.
-5. Deploy. Each visitor enters their own Groq API key and assignment URL.
+## Mobile OTP sign-in on study sites
 
-In public mode, Browserbase provides a live browser view inside the page. Each visitor's sign-in is kept in an isolated persistent Browserbase context, associated with a signed, HttpOnly cookie in that visitor's browser. The sign-in is stored in Browserbase's cloud, not on the visitor's device. Each visitor supplies their own Groq API key. It is saved in that browser's local storage, displayed in the key field, and sent to the server only when starting a run; the server does not save it. Anyone using the same browser profile can see the saved key, so do not save it on a shared device. Visitors can replace it by editing the field; if Groq rejects it, the app removes the rejected key and asks for a replacement. Create or replace keys at [Groq API Keys](https://console.groq.com/keys). Browser sessions are limited to one visitor at a time, and Browserbase usage is billed to your Browserbase account. Do not share the Browserbase API key or `APP_SECRET`.
+For Sunstone URLs, the dashboard offers an optional phone-number field. The number is used only to fill and submit the phone field on `hub.sunstone.in` or `www.hub.sunstone.in`; it is not saved in the account or database. The user enters the OTP directly in the browser view on their phone (or opens the view in a separate tab). The per-account hosted browser context is retained so Sunstone can stay signed in across later app logins. Do not send OTPs to the app or automate reading SMS messages.
+
+## Hosted deployment
+
+The Render service uses Browserbase for isolated hosted browsers. Configure these environment variables in Render:
+
+- `BROWSERBASE_API_KEY`
+- `APP_SECRET` (random, at least 32 characters)
+- `ADMIN_PASSWORD` (strong, unique password)
+- `ADMIN_USERNAME` (optional; defaults to `admin`)
+- `SUPABASE_DATABASE_URL` (recommended for hosted accounts)
+
+If you use SQLite instead, its data on an ephemeral container filesystem can be lost when a hosted service restarts or redeploys; attach persistent storage and set `APP_DATA_DIR` before inviting users. Browserbase usage and Groq API usage are billed to their respective accounts.
+
+## Payments
+
+Cashfree checkout, payment verification, and screenshot review are intentionally not included yet. Add these only when the payment flow is ready; do not treat uploaded screenshots as proof of a verified payment.
+
+The standalone command-line runner remains available with `python agent.py`.

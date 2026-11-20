@@ -4,3 +4,4 @@ __pycache__/
 *.py[cod]
 browser_profile/
 chrome-debug-profile/
+data/

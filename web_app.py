@@ -3,23 +3,483 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
+import sqlite3
 import threading
 import webbrowser
 from collections import deque
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from http.cookies import CookieError, SimpleCookie
 from urllib.parse import urlparse
 
+from cryptography.fernet import Fernet, InvalidToken
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool, PoolTimeout
 from agent import create_browserbase_context, load_env_file, run_automation
 
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8765"))
 PUBLIC_MODE = os.getenv("PUBLIC_MODE", "").strip().lower() in {"1", "true", "yes"}
 SESSION_COOKIE = "quiz_session"
-ENV_FILE_PATH = Path(__file__).with_name(".env")
+APP_ROOT = Path(__file__).resolve().parent
+DATA_DIR = Path(os.getenv("APP_DATA_DIR", str(APP_ROOT / "data")))
+if not DATA_DIR.is_absolute():
+    DATA_DIR = APP_ROOT / DATA_DIR
+DATABASE_PATH = Path(os.getenv("DATABASE_PATH", str(DATA_DIR / "study_companion.sqlite3")))
+if not DATABASE_PATH.is_absolute():
+    DATABASE_PATH = APP_ROOT / DATABASE_PATH
+SUPABASE_DATABASE_URL = os.getenv("SUPABASE_DATABASE_URL", "").strip()
+DB_LOCK = threading.Lock()
+INITIALIZED_DATABASES = set()
+DATABASE_POOL = None
+
+
+def _validate_sunstone_mobile(url, mobile_number):
+    if mobile_number is None:
+        return ""
+    if not isinstance(mobile_number, str):
+        raise ValueError("Enter a valid phone number.")
+    mobile_number = mobile_number.strip()
+    if not mobile_number:
+        return ""
+    phone_digits = re.sub(r"\D", "", mobile_number)
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if (
+        not re.fullmatch(r"\+?[0-9][0-9 ()-]{6,19}", mobile_number)
+        or not 8 <= len(phone_digits) <= 15
+    ):
+        raise ValueError("Enter a valid phone number, including its country code if needed.")
+    if parsed.scheme != "https" or host not in {
+        "hub.sunstone.in",
+        "www.hub.sunstone.in",
+    }:
+        raise ValueError("The phone number can only be used with the Sunstone HTTPS site.")
+    return mobile_number
+
+
+def _get_database_pool():
+    global DATABASE_POOL
+    with DB_LOCK:
+        if DATABASE_POOL is None:
+            DATABASE_POOL = ConnectionPool(
+                conninfo=SUPABASE_DATABASE_URL,
+                min_size=1,
+                max_size=10,
+                timeout=10,
+                kwargs={
+                    "row_factory": dict_row,
+                    "connect_timeout": 10,
+                    "prepare_threshold": None,
+                },
+                open=False,
+            )
+            DATABASE_POOL.open(wait=True, timeout=10)
+    return DATABASE_POOL
+
+
+def _initialize_database(connection, is_postgres):
+    database_identity = (
+        f"postgres:{SUPABASE_DATABASE_URL}"
+        if is_postgres
+        else f"sqlite:{DATABASE_PATH.resolve()}"
+    )
+    with DB_LOCK:
+        if database_identity not in INITIALIZED_DATABASES:
+            if is_postgres:
+                statements = (
+                    """
+                    CREATE TABLE IF NOT EXISTS users (
+                        id BIGSERIAL PRIMARY KEY,
+                        username TEXT NOT NULL UNIQUE,
+                        date_of_birth TEXT NOT NULL,
+                        password_hash TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        visitor_id TEXT,
+                        browser_context_id TEXT
+                    )
+                    """,
+                    """
+                    CREATE TABLE IF NOT EXISTS sessions (
+                        token_hash TEXT PRIMARY KEY,
+                        username TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        visitor_id TEXT NOT NULL,
+                        browser_context_id TEXT,
+                        created_at TEXT NOT NULL
+                    )
+                    """,
+                    """
+                    CREATE TABLE IF NOT EXISTS api_keys (
+                        id BIGSERIAL PRIMARY KEY,
+                        encrypted_key TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                    """,
+                )
+                for statement in statements:
+                    connection.execute(statement)
+                connection.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS visitor_id TEXT")
+                connection.execute(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS browser_context_id TEXT"
+                )
+                connection.execute(
+                    "ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_visitor_id_key"
+                )
+            else:
+                connection.executescript(
+                    """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    date_of_birth TEXT NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    visitor_id TEXT,
+                    browser_context_id TEXT
+                );
+                CREATE TABLE IF NOT EXISTS sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    visitor_id TEXT NOT NULL,
+                    browser_context_id TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS api_keys (
+                    id INTEGER PRIMARY KEY,
+                    encrypted_key TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                """
+                )
+                columns = {
+                    row["name"] for row in connection.execute("PRAGMA table_info(users)")
+                }
+                if "visitor_id" not in columns:
+                    connection.execute("ALTER TABLE users ADD COLUMN visitor_id TEXT")
+                if "browser_context_id" not in columns:
+                    connection.execute(
+                        "ALTER TABLE users ADD COLUMN browser_context_id TEXT"
+                    )
+
+                unique_visitor_index = False
+                for index in connection.execute("PRAGMA index_list(sessions)"):
+                    if not index["unique"]:
+                        continue
+                    index_columns = [
+                        row["name"]
+                        for row in connection.execute(
+                            f"PRAGMA index_info({index['name']})"
+                        )
+                    ]
+                    if index_columns == ["visitor_id"]:
+                        unique_visitor_index = True
+                        break
+                if unique_visitor_index:
+                    connection.execute("DROP TABLE IF EXISTS sessions_rebuild")
+                    connection.execute(
+                        """
+                        CREATE TABLE sessions_rebuild (
+                            token_hash TEXT PRIMARY KEY,
+                            username TEXT NOT NULL,
+                            role TEXT NOT NULL,
+                            visitor_id TEXT NOT NULL,
+                            browser_context_id TEXT,
+                            created_at TEXT NOT NULL
+                        )
+                        """
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO sessions_rebuild
+                        SELECT token_hash, username, role, visitor_id,
+                               browser_context_id, created_at
+                        FROM sessions
+                        """
+                    )
+                    connection.execute("DROP TABLE sessions")
+                    connection.execute(
+                        "ALTER TABLE sessions_rebuild RENAME TO sessions"
+                    )
+
+            existing_users = connection.execute(
+                "SELECT username, visitor_id, browser_context_id FROM users"
+            ).fetchall()
+            for user in existing_users:
+                visitor_id = user["visitor_id"] or secrets.token_urlsafe(24)
+                browser_context_id = user["browser_context_id"]
+                if not browser_context_id:
+                    previous_session = _execute(
+                        connection,
+                        """
+                        SELECT browser_context_id FROM sessions
+                        WHERE LOWER(username) = LOWER(?) AND browser_context_id IS NOT NULL
+                        ORDER BY created_at DESC LIMIT 1
+                        """,
+                        (user["username"],),
+                    ).fetchone()
+                    if previous_session:
+                        browser_context_id = previous_session["browser_context_id"]
+                _execute(
+                    connection,
+                    """
+                    UPDATE users SET visitor_id = ?, browser_context_id = ?
+                    WHERE LOWER(username) = LOWER(?)
+                    """,
+                    (visitor_id, browser_context_id, user["username"]),
+                )
+
+            if is_postgres:
+                connection.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS users_visitor_id_unique ON users (visitor_id)"
+                )
+                connection.execute("ALTER TABLE users ENABLE ROW LEVEL SECURITY")
+                connection.execute("ALTER TABLE sessions ENABLE ROW LEVEL SECURITY")
+                connection.execute("ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY")
+                connection.execute(
+                    "REVOKE ALL ON TABLE users, sessions, api_keys FROM anon, authenticated"
+                )
+                connection.execute(
+                    "REVOKE ALL ON SEQUENCE users_id_seq, api_keys_id_seq FROM anon, authenticated"
+                )
+            else:
+                connection.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS users_visitor_id_unique ON users (visitor_id)"
+                )
+                connection.commit()
+            if is_postgres:
+                connection.commit()
+            INITIALIZED_DATABASES.add(database_identity)
+
+
+@contextmanager
+def _connect_database():
+    if SUPABASE_DATABASE_URL:
+        with _get_database_pool().connection() as connection:
+            _initialize_database(connection, is_postgres=True)
+            yield connection
+        return
+
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DATABASE_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        _initialize_database(connection, is_postgres=False)
+        yield connection
+    finally:
+        connection.close()
+
+
+def _execute(connection, statement, parameters=()):
+    if SUPABASE_DATABASE_URL:
+        statement = statement.replace("?", "%s")
+    return connection.execute(statement, parameters)
+
+
+def _password_hash(password, salt=None):
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310000)
+    return f"{base64.urlsafe_b64encode(salt).decode()}:{base64.urlsafe_b64encode(digest).decode()}"
+
+
+def _verify_password(password, encoded):
+    try:
+        salt_text, digest_text = encoded.split(":", 1)
+        salt = base64.urlsafe_b64decode(salt_text)
+        expected = base64.urlsafe_b64decode(digest_text)
+    except (ValueError, TypeError):
+        return False
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310000)
+    return hmac.compare_digest(actual, expected)
+
+
+def _key_cipher():
+    secret = os.getenv("APP_SECRET", "")
+    if len(secret) < 32:
+        raise RuntimeError("Set APP_SECRET to a random value of at least 32 characters.")
+    derived_key = hashlib.sha256(b"local-study-companion-api-keys:" + secret.encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(derived_key))
+
+
+def _get_api_keys():
+    with _connect_database() as connection:
+        rows = _execute(
+            connection,
+            "SELECT encrypted_key FROM api_keys ORDER BY id"
+        ).fetchall()
+    cipher = _key_cipher()
+    try:
+        return [cipher.decrypt(row["encrypted_key"].encode()).decode() for row in rows]
+    except InvalidToken as exc:
+        raise RuntimeError("Stored API keys cannot be decrypted; check APP_SECRET.") from exc
+
+
+def _save_api_keys(keys):
+    normalized = []
+    for key in keys:
+        if not isinstance(key, str):
+            raise ValueError("Each API key must be text.")
+        key = key.strip()
+        if not key:
+            continue
+        if any(character in key for character in ("\r", "\n", "\0")):
+            raise ValueError("Each API key must be a single line.")
+        if key not in normalized:
+            normalized.append(key)
+    if not normalized:
+        raise ValueError("Enter at least one API key.")
+
+    cipher = _key_cipher()
+    with _connect_database() as connection:
+        _execute(connection, "DELETE FROM api_keys")
+        for key in normalized:
+            _execute(
+                connection,
+                "INSERT INTO api_keys (encrypted_key, created_at) VALUES (?, ?)",
+                (cipher.encrypt(key.encode()).decode(), datetime.now().isoformat()),
+            )
+        connection.commit()
+
+
+def _create_session(username, role):
+    token = secrets.token_urlsafe(48)
+    with _connect_database() as connection:
+        browser_context_id = None
+        if role == "user":
+            user = _execute(
+                connection,
+                "SELECT visitor_id, browser_context_id FROM users WHERE LOWER(username) = LOWER(?)",
+                (username,),
+            ).fetchone()
+            if not user:
+                raise RuntimeError("The user account could not be loaded.")
+            visitor_id = user["visitor_id"]
+            browser_context_id = user["browser_context_id"]
+        else:
+            visitor_id = secrets.token_urlsafe(24)
+        _execute(
+            connection,
+            """
+            INSERT INTO sessions (
+                token_hash, username, role, visitor_id, browser_context_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                hashlib.sha256(token.encode()).hexdigest(),
+                username,
+                role,
+                visitor_id,
+                browser_context_id,
+                datetime.now().isoformat(),
+            ),
+        )
+        connection.commit()
+    return token
+
+
+def _load_session(token):
+    if not token:
+        return None
+    with _connect_database() as connection:
+        row = _execute(
+            connection,
+            "SELECT * FROM sessions WHERE token_hash = ?",
+            (hashlib.sha256(token.encode()).hexdigest(),),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def _session_from_request(handler):
+    cookie = SimpleCookie()
+    try:
+        cookie.load(handler.headers.get("Cookie", ""))
+    except CookieError:
+        return None
+    morsel = cookie.get(SESSION_COOKIE)
+    return _load_session(morsel.value if morsel else "")
+
+
+AUTH_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#f5f7fc"><title>Sign in · Study Companion</title>
+<style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;background:#f5f7fc;color:#172033;font:16px/1.5 Inter,"Segoe UI",sans-serif}
+main{width:min(440px,100%)}.brand{font-weight:800;font-size:1.55rem;letter-spacing:-.04em;margin:0 0 5px}.intro{color:#69758b;margin:0 0 24px}
+.card{background:#fff;border:1px solid #e3e8f0;border-radius:20px;padding:24px;box-shadow:0 14px 44px #1720330c}
+nav{display:flex;gap:8px;margin-bottom:20px}.tab{flex:1;background:#edf0f5;color:#46536a}.tab.selected{background:#465cf5;color:white}
+label{display:block;font-weight:650;font-size:.9rem;margin:14px 0 6px}input{width:100%;padding:13px 14px;border:1px solid #cbd4e2;border-radius:11px;font:inherit;min-height:48px}
+input:focus{outline:3px solid #536dfe22;border-color:#536dfe}button{border:0;border-radius:11px;padding:12px 16px;font:inherit;font-weight:700;cursor:pointer;min-height:46px}.primary{width:100%;margin-top:20px;background:#465cf5;color:#fff}.primary:disabled{opacity:.55}
+.hint,#feedback{font-size:.87rem;color:#768197}#feedback{min-height:1.4em;margin:12px 0 0}.hidden{display:none!important}
+@media(max-width:480px){body{padding:14px} .card{padding:20px;border-radius:16px} }
+</style></head><body><main><h1 class="brand">Study Companion</h1><p class="intro">Sign in to continue, or create your account.</p>
+<section class="card"><nav><button id="login-tab" class="tab selected" type="button">Sign in</button><button id="signup-tab" class="tab" type="button">Create account</button></nav>
+<form id="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" minlength="3" maxlength="32" required>
+<div id="dob-wrap" class="hidden"><label for="dob">Date of birth</label><input id="dob" name="dob" type="text" inputmode="numeric" autocomplete="bday" maxlength="10" placeholder="MM/DD/YYYY" aria-describedby="dob-hint"><p id="dob-hint" class="hint">Enter digits like 352000 or 03052000; dates display as MM/DD/YYYY.</p></div>
+<label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" minlength="10" required>
+<button id="submit" class="primary" type="submit">Sign in</button><p id="feedback" role="status" aria-live="polite"></p></form>
+<p class="hint">Your session stays signed in on this device until you log out.</p></section></main>
+<script>
+const form=document.querySelector("#auth-form"),feedback=document.querySelector("#feedback"),dobWrap=document.querySelector("#dob-wrap"),dobInput=document.querySelector("#dob"),password=document.querySelector("#password"),submit=document.querySelector("#submit");
+let mode="login";
+function formatDob(value,allowCompact=false){if(value.includes("/")){const parts=value.split("/");if(parts.length===3&&/^\d{1,2}$/.test(parts[0])&&/^\d{1,2}$/.test(parts[1])&&/^\d{4}$/.test(parts[2]))return`${parts[0].padStart(2,"0")}/${parts[1].padStart(2,"0")}/${parts[2]}`;return value.slice(0,10)}const digits=value.replace(/\D/g,"").slice(0,8);if(digits.length===8)return`${digits.slice(0,2)}/${digits.slice(2,4)}/${digits.slice(4)}`;if(!allowCompact||![6,7].includes(digits.length))return digits;const year=digits.slice(-4),dateDigits=digits.slice(0,-4);let month,day;if(digits.length===6){month=dateDigits[0];day=dateDigits[1]}else{const twoDigitMonth=Number(dateDigits.slice(0,2)),oneDigitDay=Number(dateDigits[2]);if(twoDigitMonth>=1&&twoDigitMonth<=12&&oneDigitDay>=1&&oneDigitDay<=31){month=dateDigits.slice(0,2);day=dateDigits[2]}else{const oneDigitMonth=Number(dateDigits[0]),twoDigitDay=Number(dateDigits.slice(1));if(oneDigitMonth<1||oneDigitMonth>12||twoDigitDay<1||twoDigitDay>31)return digits;month=dateDigits[0];day=dateDigits.slice(1)}}return`${month.padStart(2,"0")}/${day.padStart(2,"0")}/${year}`}
+function birthDateToIso(value){const match=/^(\d{2})\/(\d{2})\/(\d{4})$/.exec(value);if(!match)throw new Error("Enter your date of birth as MM/DD/YYYY.");return`${match[3]}-${match[1]}-${match[2]}`}
+dobInput.addEventListener("input",()=>{const digits=dobInput.value.replace(/\D/g,"").slice(0,8),year=Number(digits.slice(-4));let formatted=formatDob(dobInput.value);if(!dobInput.value.includes("/")&&[6,7].includes(digits.length)&&year>=1900&&year<=new Date().getFullYear())formatted=formatDob(dobInput.value,true);if(formatted!==dobInput.value)dobInput.value=formatted});
+dobInput.addEventListener("blur",()=>{dobInput.value=formatDob(dobInput.value,true)});
+function choose(next){mode=next;document.querySelector("#login-tab").classList.toggle("selected",mode==="login");document.querySelector("#signup-tab").classList.toggle("selected",mode==="signup");dobWrap.classList.toggle("hidden",mode!=="signup");dobInput.required=mode==="signup";password.autocomplete=mode==="signup"?"new-password":"current-password";submit.textContent=mode==="signup"?"Create account":"Sign in";feedback.textContent=""}
+document.querySelector("#login-tab").addEventListener("click",()=>choose("login"));document.querySelector("#signup-tab").addEventListener("click",()=>choose("signup"));
+form.addEventListener("submit",async event=>{event.preventDefault();const body={username:form.username.value.trim(),password:password.value};if(mode==="signup"){dobInput.value=formatDob(dobInput.value,true);try{body.date_of_birth=birthDateToIso(dobInput.value)}catch(error){feedback.textContent=error.message;return}}submit.disabled=true;feedback.textContent="Please wait…";try{const response=await fetch(`/api/auth/${mode}`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});const result=await response.json();if(!response.ok)throw new Error(result.error||"Could not sign in.");location.href=result.role==="admin"?"/admin":"/"}catch(error){feedback.textContent=error.message}finally{submit.disabled=false}});
+</script></body></html>"""
+
+
+ADMIN_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#f5f7fc"><title>Admin · Study Companion</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f5f7fc;color:#172033;font:16px/1.5 Inter,"Segoe UI",sans-serif;padding:24px}
+main{width:min(900px,100%);margin:auto}header{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:0 0 24px}
+h1{font-size:clamp(1.5rem,5vw,2rem);margin:0;letter-spacing:-.04em}.subtitle,.hint{color:#768197;font-size:.9rem}
+.header-actions,.tabs,.user-meta,.reset-form{display:flex;align-items:center;gap:10px}.header-actions{flex-wrap:wrap}
+.card{background:white;border:1px solid #e3e8f0;border-radius:18px;padding:24px;margin:14px 0;box-shadow:0 10px 32px #17203308}
+.tabs{padding:5px;background:#e9edf5;border-radius:12px;width:max-content;max-width:100%;margin-bottom:18px}
+button,a.button{min-height:44px;display:inline-flex;justify-content:center;align-items:center;border:0;border-radius:10px;padding:10px 16px;font:inherit;font-weight:700;cursor:pointer;text-decoration:none}
+.tab{background:transparent;color:#536078}.tab[aria-selected="true"]{background:#fff;color:#3549dd;box-shadow:0 2px 6px #17203312}
+.primary{background:#465cf5;color:white}.secondary{background:#edf0f5;color:#344158}.danger{color:#9e3434;background:#fff0ef}
+label{display:block;font-weight:650;margin-bottom:8px}input,textarea{width:100%;min-height:46px;padding:11px 13px;border:1px solid #cbd4e2;border-radius:10px;font:inherit}
+textarea{min-height:110px;resize:vertical}.search-row{display:flex;align-items:center;gap:12px;margin:18px 0}.search-row input{max-width:420px}
+.count{white-space:nowrap;color:#68758a;font-size:.9rem}.user-list,#keys{display:grid;gap:12px;margin:16px 0 0;padding:0;list-style:none}
+.user-card,#keys li{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;padding:16px;border:1px solid #e8ecf3;border-radius:13px}
+.user-name{font-weight:750;font-size:1.03rem}.user-meta{flex-wrap:wrap;margin-top:5px;color:#758096;font-size:.87rem}
+.reset-form{align-items:flex-end;min-width:min(360px,100%)}.reset-form label{flex:1;min-width:160px;margin:0}
+.hint{margin:8px 0 0;line-height:1.45}.feedback,#feedback{min-height:1.4em;color:#46536a;margin:12px 0 0}
+.panel[hidden]{display:none!important}button:disabled{opacity:.55;cursor:not-allowed}
+@media(max-width:620px){body{padding:14px}header{align-items:flex-start;flex-direction:column}.header-actions{width:100%;justify-content:space-between}.card{padding:17px;border-radius:15px}.tabs{width:100%}.tab{flex:1}.search-row{align-items:stretch;flex-direction:column}.search-row input{max-width:none}.user-card,#keys li{flex-direction:column;gap:14px}.reset-form{width:100%;align-items:stretch;flex-direction:column}.reset-form label{width:100%}.reset-form button{width:100%}}
+</style></head><body><main><header><div><h1>Admin dashboard</h1><div class="subtitle">Manage member profiles and shared model access.</div></div><div class="header-actions"><a class="button secondary" href="/">Back to app</a><button id="logout" class="secondary" type="button">Log out</button></div></header>
+<nav class="tabs" aria-label="Admin sections"><button class="tab" data-panel="users-panel" aria-selected="true" type="button">Users</button><button class="tab" data-panel="keys-panel" aria-selected="false" type="button">API keys</button></nav>
+<section id="users-panel" class="panel card"><div><h2>Accounts</h2><p class="hint">Usernames, dates of birth, and account creation dates. Passwords are never viewable; resets replace the password with a new one and sign out existing sessions.</p><p id="user-feedback" class="feedback" role="status" aria-live="polite"></p></div>
+<div class="search-row"><input id="user-search" type="search" placeholder="Search usernames" aria-label="Search users"><span id="user-count" class="count">Loading users…</span></div><div id="users" class="user-list"></div></section>
+<section id="keys-panel" class="panel card" hidden><form id="key-form"><label for="api-keys">Add API keys</label><textarea id="api-keys" placeholder="Paste one Groq API key per line" autocomplete="off" spellcheck="false" required></textarea><p class="hint">Keys are encrypted at rest and never shown again.</p><button class="primary" id="save" type="submit">Add keys</button><p id="feedback" role="status" aria-live="polite"></p></form>
+<h2 style="margin-top:24px">Configured keys</h2><p class="hint">A failed key is skipped during the current run.</p><ul id="keys"></ul></section></main>
+<script>
+const feedback=document.querySelector("#feedback"),userFeedback=document.querySelector("#user-feedback"),usersList=document.querySelector("#users"),userSearch=document.querySelector("#user-search"),userCount=document.querySelector("#user-count");
+async function request(path,options={}){const response=await fetch(path,{...options,headers:{"Content-Type":"application/json",...(options.headers||{})}});const data=await response.json();if(!response.ok)throw new Error(data.error||"Request failed.");return data}
+let users=[];
+function formatBirthDate(value){const match=/^(\d{4})-(\d{2})-(\d{2})$/.exec(value);return match?`${match[2]}/${match[3]}/${match[1]}`:value}
+function renderUsers(){const query=userSearch.value.trim().toLowerCase(),visible=users.filter(user=>user.username.toLowerCase().includes(query));usersList.replaceChildren();userCount.textContent=`${visible.length} of ${users.length} accounts`;if(!visible.length){const empty=document.createElement("p");empty.className="hint";empty.textContent=users.length?"No usernames match your search.":"No accounts yet.";usersList.append(empty);return}for(const user of visible){const card=document.createElement("article"),profile=document.createElement("div"),name=document.createElement("div"),meta=document.createElement("div"),form=document.createElement("form"),label=document.createElement("label"),input=document.createElement("input"),button=document.createElement("button");card.className="user-card";profile.className="profile";name.className="user-name";name.textContent=user.username;meta.className="user-meta";meta.textContent=`Date of birth: ${formatBirthDate(user.date_of_birth)} · Joined: ${new Date(user.created_at).toLocaleDateString()}`;profile.append(name,meta);form.className="reset-form";label.textContent="Set new password";input.type="password";input.name="new_password";input.autocomplete="new-password";input.minLength=10;input.required=true;label.append(input);button.type="submit";button.className="secondary";button.textContent="Reset password";form.append(label,button);form.addEventListener("submit",async event=>{event.preventDefault();button.disabled=true;try{await request("/api/admin/users/reset-password",{method:"POST",body:JSON.stringify({username:user.username,new_password:input.value})});input.value="";userFeedback.textContent=`Password reset for ${user.username}; their existing sessions were revoked.`}catch(error){userFeedback.textContent=error.message}finally{button.disabled=false}});card.append(profile,form);usersList.append(card)}}
+async function refreshUsers(){try{const data=await request("/api/admin/users");users=data.users;renderUsers()}catch(error){userCount.textContent=error.message}}
+async function refreshKeys(){const list=document.querySelector("#keys");try{const data=await request("/api/admin/keys");list.replaceChildren();if(!data.keys.length){const item=document.createElement("li");item.textContent="No keys configured yet.";list.append(item);return}for(const key of data.keys){const item=document.createElement("li"),label=document.createElement("span"),remove=document.createElement("button");label.textContent=`Key ${key.id} · ${key.masked}`;remove.textContent="Remove";remove.className="secondary";remove.addEventListener("click",async()=>{try{await request("/api/admin/keys",{method:"DELETE",body:JSON.stringify({id:key.id})});await refreshKeys()}catch(error){feedback.textContent=error.message}});item.append(label,remove);list.append(item)}}catch(error){feedback.textContent=error.message}}
+document.querySelectorAll(".tab").forEach(tab=>tab.addEventListener("click",()=>{document.querySelectorAll(".tab").forEach(item=>item.setAttribute("aria-selected",String(item===tab)));document.querySelectorAll(".panel").forEach(panel=>panel.hidden=panel.id!==tab.dataset.panel);if(tab.dataset.panel==="keys-panel")refreshKeys()}));
+userSearch.addEventListener("input",renderUsers);
+document.querySelector("#key-form").addEventListener("submit",async event=>{event.preventDefault();const button=document.querySelector("#save");button.disabled=true;try{await request("/api/admin/keys",{method:"POST",body:JSON.stringify({keys:document.querySelector("#api-keys").value.split(/\r?\n/)})});document.querySelector("#api-keys").value="";feedback.textContent="Keys added.";await refreshKeys()}catch(error){feedback.textContent=error.message}finally{button.disabled=false}});
+document.querySelector("#logout").addEventListener("click",async()=>{await request("/api/auth/logout",{method:"POST",body:"{}"});location.href="/"});refreshUsers();
+</script></body></html>"""
+
 PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -29,8 +489,8 @@ PAGE = r"""<!doctype html>
   <style>
     :root { color-scheme: light; font-family: Inter, "Segoe UI", sans-serif; background: #f3f5f9; color: #172033; }
     * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 28px 16px; }
-    main { width: min(760px, 100%); }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: start center; padding: 24px 16px; }
+    main { width: min(820px, 100%); }
     header { margin: 0 0 22px; }
     .brand { display: flex; align-items: center; gap: 12px; }
     .brand-mark { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 13px; background: #465cf5; color: white; font-size: .82rem; font-weight: 800; letter-spacing: .04em; box-shadow: 0 5px 14px #465cf533; }
@@ -39,8 +499,8 @@ PAGE = r"""<!doctype html>
     header p { margin: 12px 0 0; color: #69758b; line-height: 1.55; }
     .card { background: white; border: 1px solid #e3e8f0; border-radius: 18px; padding: 24px; box-shadow: 0 12px 36px #1720330b; margin: 14px 0; }
     label { display: block; font-size: .9rem; font-weight: 650; margin: 0 0 8px; }
-    input[type=url], input[type=password] { width: 100%; min-width: 0; padding: 13px 14px; border: 1px solid #cbd4e2; border-radius: 10px; font: inherit; outline: none; }
-    input[type=url]:focus, input[type=password]:focus { border-color: #536dfe; box-shadow: 0 0 0 3px #536dfe22; }
+    input[type=url], input[type=tel] { width: 100%; min-width: 0; min-height: 48px; padding: 13px 14px; border: 1px solid #cbd4e2; border-radius: 10px; font: inherit; outline: none; }
+    input[type=url]:focus, input[type=tel]:focus { border-color: #536dfe; box-shadow: 0 0 0 3px #536dfe22; }
     .hint { margin: 8px 0 0; color: #7a8497; font-size: .84rem; line-height: 1.45; }
     .key-row { display: flex; align-items: center; gap: 10px; }
     .key-row button { flex: 0 0 auto; }
@@ -48,7 +508,7 @@ PAGE = r"""<!doctype html>
     .check { display: flex; gap: 10px; align-items: flex-start; margin: 18px 0; font-weight: 500; line-height: 1.45; }
     .check input { margin-top: 3px; }
     .actions { display: flex; gap: 10px; }
-    button { border: 0; border-radius: 10px; padding: 11px 17px; font: inherit; font-weight: 650; cursor: pointer; }
+    button { min-height: 44px; border: 0; border-radius: 10px; padding: 11px 17px; font: inherit; font-weight: 650; cursor: pointer; }
     button:disabled { opacity: .48; cursor: not-allowed; }
     .primary { color: white; background: #465cf5; }
     .primary:hover:not(:disabled) { background: #3549dd; }
@@ -62,13 +522,28 @@ PAGE = r"""<!doctype html>
     #progress { margin-top: 8px; font-size: .9rem; color: #768197; }
     .notice { padding: 12px 14px; background: #fff8e8; border: 1px solid #f3e4bc; border-radius: 10px; color: #6a5421; font-size: .86rem; line-height: 1.5; margin-top: 18px; }
     .public-only { display: none; }
+    .account-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+    .account-actions a { color: #5365e7; font-size: .86rem; font-weight: 650; text-decoration: none; white-space: nowrap; }
     .browser-view { width: 100%; aspect-ratio: 16 / 10; border: 1px solid #dce2ed; border-radius: 10px; background: #111827; }
     h2 { font-size: 1rem; margin: 0 0 12px; }
     #logs { margin: 0; padding: 0; list-style: none; max-height: 230px; overflow: auto; }
     #logs li { padding: 9px 0; border-top: 1px solid #edf0f5; color: #5e6a7e; font-size: .86rem; line-height: 1.4; overflow-wrap: anywhere; }
     #logs time { color: #9aa3b2; margin-right: 8px; font-variant-numeric: tabular-nums; }
     footer { padding: 4px 0 8px; text-align: center; color: #a0a8b6; font-size: .76rem; letter-spacing: .02em; }
-    @media (max-width: 520px) { .card { padding: 18px; } .actions button { flex: 1; } .key-row { align-items: stretch; flex-direction: column; } .key-row button { width: 100%; } .byline { font-size: .72rem; } }
+    @media (max-width: 520px) {
+      body { padding: 16px 12px; }
+      .card { padding: 17px; border-radius: 15px; }
+      .brand { gap: 9px; flex-wrap: wrap; }
+      .brand-mark { width: 38px; height: 38px; }
+      h1 { font-size: 1.55rem; }
+      .byline { display: none; }
+      .account-actions { width: 100%; justify-content: flex-end; margin-left: 0; }
+      .actions { flex-wrap: wrap; }
+      .actions button { flex: 1 1 120px; min-height: 46px; }
+      .status-row { align-items: flex-start; flex-wrap: wrap; }
+      .browser-view { height: min(70vh, 620px); aspect-ratio: auto; }
+      #logs { max-height: 180px; }
+    }
   </style>
 </head>
 <body>
@@ -78,32 +553,19 @@ PAGE = r"""<!doctype html>
       <span class="brand-mark" aria-hidden="true">AK</span>
       <h1>Quiz Assistant</h1>
       <span class="byline">Made by Akash</span>
+      <nav class="account-actions"><span id="account-name"></span><a id="admin-link" href="/admin" hidden>Admin</a><button id="logout" class="secondary" type="button">Log out</button></nav>
     </div>
-    <p id="intro">Your local companion for working in a separate browser window. Sign in there if needed; your browser session stays on this computer.</p>
+    <p id="intro">Your study companion. Sign in to the assignment in the browser when prompted.</p>
   </header>
   <section class="card">
-    <h2>One-time setup (Go to https://groq.com -> API Keys -> Create API Key -> Copy it -> Paste it here)</h2>
-    <form id="key-form">
-      <label for="api-key">Groq API key</label>
-      <div class="key-row">
-        <input id="api-key" name="api-key" type="password" placeholder="Paste your Groq API key" autocomplete="off" autocapitalize="off" spellcheck="false" required>
-        <button id="save-key" class="secondary" type="submit">Save key</button>
-      </div>
-      <p class="hint">Saved only on this computer. It isn’t shown in the page or activity log, and you can replace it anytime.</p>
-      <p id="key-status" class="hint" role="status" aria-live="polite"></p>
-    </form>
-  </section>
-  <section class="card">
     <form id="start-form">
-      <div id="public-key-row" class="public-only">
-        <label for="groq-key">Your Groq API key</label>
-        <input id="groq-key" name="groq-key" type="text" placeholder="Paste your Groq API key" autocomplete="off" autocapitalize="off" spellcheck="false">
-        <p class="hint">Your key is visible and saved in this browser only. It is sent over HTTPS for your run and is not stored by the server. Anyone using this same browser profile can see it.</p>
-        <p class="hint">Get a key: sign in to <a href="https://console.groq.com/keys" target="_blank" rel="noopener noreferrer">Groq API Keys</a>, choose <strong>Create API Key</strong>, then paste it here. To change it, replace the text below; it saves automatically.</p>
-        <p id="public-key-status" class="hint" role="status" aria-live="polite"></p>
-      </div>
-      <label for="url">Assignment URL (Note - This will only work for MCQ's only)</label>
+      <label for="url">Assignment URL</label>
       <input id="url" name="url" type="url" placeholder="https://example.com/assignment" required>
+      <div id="sunstone-phone-row" hidden>
+        <label for="sunstone-phone">Sunstone mobile number (optional)</label>
+        <input id="sunstone-phone" name="sunstone-phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="Include country code if needed">
+        <p class="hint">Only sent to Sunstone to fill its phone field. The app does not save your number or handle OTPs. Sunstone's browser session can stay signed in for later visits.</p>
+      </div>
       <p id="browser-hint" class="hint">The automation uses the local <code>browser_profile</code> and never uploads your browser session.</p>
       <label class="check">
         <input id="auto-start" type="checkbox">
@@ -114,14 +576,14 @@ PAGE = r"""<!doctype html>
         <button id="stop" class="secondary" type="button" disabled>Stop</button>
       </div>
     </form>
-    <div id="run-notice" class="notice">It stops before final submission. Review and submit manually in Chrome; the browser stays open until you click Close browser. Starting an assignment may use an attempt; confirm you’re allowed to automate it.</div>
+    <div id="run-notice" class="notice">It stops before final submission. Review and submit manually in Chrome; the browser stays open until you click Close browser. For phone + OTP sign-in, type the code yourself in the browser; this app never asks for it.</div>
   </section>
   <section id="browser-view-card" class="card public-only">
     <div class="status-row">
       <h2>Remote browser</h2>
       <a id="open-browser-view" class="hint" href="#" target="_blank" rel="noopener noreferrer">Open in new tab</a>
     </div>
-    <p class="hint">Sign in here if needed. This visitor’s browser session is kept in an isolated hosted context.</p>
+    <p class="hint">Sign in here if needed. You can type your phone number and OTP directly into this isolated browser; the code is not sent to this app.</p>
     <iframe id="browser-view" class="browser-view" title="Remote browser live view" sandbox="allow-same-origin allow-scripts" allow="clipboard-read; clipboard-write"></iframe>
   </section>
   <section class="card" aria-live="polite">
@@ -143,16 +605,12 @@ PAGE = r"""<!doctype html>
 </main>
 <script>
   const form = document.querySelector("#start-form");
-  const keyForm = document.querySelector("#key-form");
-  const keyInput = document.querySelector("#api-key");
-  const saveKeyButton = document.querySelector("#save-key");
-  const keyStatus = document.querySelector("#key-status");
+  const urlInput = document.querySelector("#url");
+  const sunstonePhoneRow = document.querySelector("#sunstone-phone-row");
+  const sunstonePhoneInput = document.querySelector("#sunstone-phone");
   const startButton = document.querySelector("#start");
   const stopButton = document.querySelector("#stop");
   const closeButton = document.querySelector("#close-browser");
-  const publicKeyRow = document.querySelector("#public-key-row");
-  const publicKeyInput = document.querySelector("#groq-key");
-  const publicKeyStatus = document.querySelector("#public-key-status");
   const browserViewCard = document.querySelector("#browser-view-card");
   const browserView = document.querySelector("#browser-view");
   const openBrowserView = document.querySelector("#open-browser-view");
@@ -162,9 +620,7 @@ PAGE = r"""<!doctype html>
   const progress = document.querySelector("#progress");
   const logs = document.querySelector("#logs");
   let lastLogCount = -1;
-  let keyStatusEdited = false;
   let publicMode = false;
-  let publicKeyInitialized = false;
   let lastState = null;
   const labels = {
     idle: "Idle", starting: "Starting", navigating: "Opening browser",
@@ -189,31 +645,14 @@ PAGE = r"""<!doctype html>
     return result;
   }
 
-  keyForm.addEventListener("submit", async event => {
-    event.preventDefault();
-    saveKeyButton.disabled = true;
-    keyStatusEdited = true;
-    keyStatus.textContent = "Saving your key on this computer…";
-    try {
-      await send("/api/config", {api_key: keyInput.value});
-      keyInput.value = "";
-      keyStatus.textContent = "Saved. You can replace the key anytime.";
-      await refresh();
-    } catch (error) {
-      keyStatus.textContent = error.message;
-    } finally {
-      saveKeyButton.disabled = false;
-    }
-  });
-
   form.addEventListener("submit", async event => {
     event.preventDefault();
     startButton.disabled = true;
     try {
       await send("/api/start", {
-        url: document.querySelector("#url").value.trim(),
+        url: urlInput.value.trim(),
         auto_start: document.querySelector("#auto-start").checked,
-        api_key: publicMode ? publicKeyInput.value : undefined
+        mobile_number: sunstonePhoneRow.hidden ? "" : sunstonePhoneInput.value.trim()
       });
       await refresh();
     } catch (error) {
@@ -248,27 +687,9 @@ PAGE = r"""<!doctype html>
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Could not load session status.");
       publicMode = Boolean(data.public_mode);
+      document.querySelector("#account-name").textContent = data.username || "";
+      document.querySelector("#admin-link").hidden = data.role !== "admin";
       const state = data.state || "idle";
-      if (data.public_mode && !publicKeyInitialized) {
-        publicKeyInitialized = true;
-        try {
-          publicKeyInput.value = localStorage.getItem("quiz-assistant-groq-api-key") || "";
-          publicKeyStatus.textContent = publicKeyInput.value
-            ? "Your key is saved in this browser."
-            : "Paste your key once; it will be saved in this browser.";
-        } catch (error) {
-          publicKeyStatus.textContent = `Could not read the saved key from this browser: ${error.message}`;
-        }
-      }
-      if (state === "api_key_rejected" && lastState !== state) {
-        publicKeyInput.value = "";
-        try {
-          localStorage.removeItem("quiz-assistant-groq-api-key");
-          publicKeyStatus.textContent = "Groq rejected that key, so it was removed. Create a new key at Groq API Keys and paste it here.";
-        } catch (error) {
-          publicKeyStatus.textContent = `Groq rejected that key. Replace it above. Browser storage error: ${error.message}`;
-        }
-      }
       lastState = state;
       const active = activeStates.has(state);
       stateLabel.textContent = labels[state] || state;
@@ -277,10 +698,7 @@ PAGE = r"""<!doctype html>
       progress.textContent = data.question
         ? `Question ${data.question}${data.total ? ` of ${data.total}` : ""}`
         : "";
-      startButton.disabled = active || data.worker_alive
-        || (data.public_mode
-          ? !publicKeyInput.value.trim()
-          : !data.api_key_configured);
+      startButton.disabled = active || data.worker_alive || !data.api_key_configured;
       stopButton.disabled = !active;
       closeButton.disabled = !data.close_available;
       if (data.logs.length !== lastLogCount) {
@@ -295,12 +713,9 @@ PAGE = r"""<!doctype html>
         }
       }
       if (!data.api_key_configured) {
-        message.textContent = "Save your Groq key above to enable Start.";
+        message.textContent = "The administrator needs to configure an API key before runs can start.";
       }
       if (data.public_mode) {
-        keyForm.closest(".card").style.display = "none";
-        publicKeyRow.style.display = "block";
-        publicKeyInput.required = true;
         browserViewCard.style.display = data.live_view_url ? "block" : "none";
         if (data.live_view_url && browserView.src !== data.live_view_url) {
           browserView.src = data.live_view_url;
@@ -309,72 +724,43 @@ PAGE = r"""<!doctype html>
           browserView.src = "about:blank";
           openBrowserView.href = "#";
         }
-        document.querySelector("#intro").textContent =
-          "Use the hosted browser below. Sign-in is kept in an isolated Browserbase cloud context linked to this browser.";
         document.querySelector("#browser-hint").textContent =
-          "Your sign-in is stored in this visitor’s Browserbase context, not on this device or shared with other visitors.";
+          "Your sign-in is stored in an isolated hosted browser context linked to your account.";
         document.querySelector("#run-notice").textContent =
-          "It stops before final submission. Review and submit manually in the browser view. Starting an assignment may use an attempt; confirm you’re allowed to automate it.";
-      }
-      if (!keyStatusEdited && !data.public_mode) {
-        keyStatus.textContent = data.api_key_configured
-          ? "A key is saved on this computer. Paste another one above to replace it."
-          : "Add it once here; you won’t need to re-enter it each time.";
+          "It stops before final submission. Review and submit manually in the browser view. Enter any phone number and OTP yourself; the app never asks for your code.";
       }
     } catch (error) {
       message.textContent = error.message || (publicMode
         ? "Could not load your hosted browser session. Refresh and try again."
         : "Could not reach the local app. Check that web_app.py is still running.");
+      if (error.message && error.message.includes("Sign in")) location.href = "/login";
     }
   }
 
-  publicKeyInput.addEventListener("change", () => {
-    try {
-      publicKeyInput.value = publicKeyInput.value.trim();
-      if (publicKeyInput.value) {
-        localStorage.setItem("quiz-assistant-groq-api-key", publicKeyInput.value);
-        publicKeyStatus.textContent = "Saved in this browser.";
-      } else {
-        localStorage.removeItem("quiz-assistant-groq-api-key");
-        publicKeyStatus.textContent = "Saved key removed from this browser.";
-      }
-    } catch (error) {
-      publicKeyStatus.textContent = `Could not save the key in this browser: ${error.message}`;
-    }
+  document.querySelector("#logout").addEventListener("click", async () => {
+    try { await send("/api/auth/logout", {}); location.href = "/login"; }
+    catch (error) { message.textContent = error.message; }
   });
 
+  function updateSunstonePhoneField() {
+    let isSunstone = false;
+    try {
+      const host = new URL(urlInput.value).hostname.toLowerCase().replace(/\.$/, "");
+      isSunstone = host === "hub.sunstone.in" || host === "www.hub.sunstone.in";
+    } catch (error) {
+      isSunstone = false;
+    }
+    sunstonePhoneRow.hidden = !isSunstone;
+    if (!isSunstone) sunstonePhoneInput.value = "";
+  }
+  urlInput.addEventListener("input", updateSunstonePhoneField);
+  updateSunstonePhoneField();
+
   refresh();
-  setInterval(refresh, 800);
+  setInterval(refresh, 1800);
 </script>
 </body>
 </html>"""
-
-
-def save_api_key(api_key: str) -> None:
-    key = api_key.strip()
-    if not key:
-        raise ValueError("Paste your Groq API key first.")
-    if any(character in key for character in ("\r", "\n", "\0")):
-        raise ValueError("The API key must be a single line.")
-
-    lines = ENV_FILE_PATH.read_text(encoding="utf-8").splitlines() if ENV_FILE_PATH.exists() else []
-    updated_lines = []
-    key_written = False
-    for line in lines:
-        normalized = line.strip()
-        if normalized.startswith("GROQ_API_KEY=") or normalized.startswith("export GROQ_API_KEY="):
-            if not key_written:
-                updated_lines.append(f"GROQ_API_KEY={key}")
-                key_written = True
-            continue
-        updated_lines.append(line)
-    if not key_written:
-        if updated_lines and updated_lines[-1]:
-            updated_lines.append("")
-        updated_lines.append(f"GROQ_API_KEY={key}")
-
-    ENV_FILE_PATH.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
-    os.environ["GROQ_API_KEY"] = key
 
 
 class RunController:
@@ -408,19 +794,24 @@ class RunController:
                 "message": message,
             })
 
-    def start(self, url, auto_start, api_key=None, browser_context_id=None):
+    def start(
+        self,
+        url,
+        auto_start,
+        api_keys=None,
+        browser_context_id=None,
+        mobile_number=None,
+    ):
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("Enter a full http:// or https:// assignment URL.")
-        if PUBLIC_MODE:
-            if not isinstance(api_key, str) or not api_key.strip():
-                raise ValueError("Paste your Groq API key to start.")
-            if not browser_context_id:
-                raise ValueError("The visitor browser context is missing. Refresh the page.")
-        else:
-            load_env_file()
-            if not os.environ.get("GROQ_API_KEY", "").strip():
-                raise ValueError("GROQ_API_KEY is missing from .env.")
+        mobile_number = _validate_sunstone_mobile(url, mobile_number)
+        api_keys = api_keys if api_keys is not None else _get_api_keys()
+        if not api_keys:
+            raise ValueError("The administrator has not configured any API keys yet.")
+        mobile_number = _validate_sunstone_mobile(url, mobile_number)
+        if PUBLIC_MODE and not browser_context_id:
+            raise ValueError("The visitor browser context is missing. Refresh the page.")
         with self.lock:
             if self.worker and self.worker.is_alive():
                 raise ValueError("A run is already active.")
@@ -440,13 +831,22 @@ class RunController:
             })
             self.worker = threading.Thread(
                 target=self._run,
-                args=(url, auto_start, self.stop_event, api_key, browser_context_id),
+                args=(
+                    url,
+                    auto_start,
+                    self.stop_event,
+                    api_keys,
+                    browser_context_id,
+                    mobile_number,
+                ),
                 name="quiz-runner",
                 daemon=True,
             )
             self.worker.start()
 
-    def _run(self, url, auto_start, stop_event, api_key, browser_context_id):
+    def _run(
+        self, url, auto_start, stop_event, api_keys, browser_context_id, mobile_number
+    ):
         try:
             result = run_automation(
                 url,
@@ -455,13 +855,14 @@ class RunController:
                 close_event=self.close_event,
                 auto_start=auto_start,
                 keep_browser_open=True,
-                api_key=api_key,
                 browser_context_id=browser_context_id,
+                api_keys=api_keys,
+                mobile_number=mobile_number,
             )
             if result == "api_key_rejected":
                 self.report({
                     "status": result,
-                    "message": "Groq rejected your API key. Replace it above; get a new key at https://console.groq.com/keys.",
+                    "message": "All configured Groq API keys were rejected. Ask the administrator to replace them.",
                     "live_view_url": "",
                 })
                 return
@@ -512,53 +913,15 @@ class RunController:
     def snapshot(self):
         with self.lock:
             worker_alive = bool(self.worker and self.worker.is_alive())
+            keys_configured = bool(_get_api_keys())
             return {
                 **self.state,
                 "logs": list(self.logs),
-                "api_key_configured": (
-                    True if PUBLIC_MODE
-                    else bool(os.environ.get("GROQ_API_KEY", "").strip())
-                ),
+                "api_key_configured": keys_configured,
                 "worker_alive": worker_alive,
                 "close_available": worker_alive and self.state["state"] == "awaiting_close",
                 "public_mode": PUBLIC_MODE,
             }
-
-
-def encode_session_cookie(visitor_id, browser_context_id=None):
-    secret = os.getenv("APP_SECRET", "")
-    if len(secret) < 32:
-        raise RuntimeError("Set APP_SECRET to a random value of at least 32 characters.")
-    payload = json.dumps(
-        {"visitor_id": visitor_id, "browser_context_id": browser_context_id},
-        separators=(",", ":"),
-    ).encode("utf-8")
-    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
-    signature = hmac.new(secret.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256).hexdigest()
-    return f"{encoded}.{signature}"
-
-
-def decode_session_cookie(token):
-    secret = os.getenv("APP_SECRET", "")
-    if len(secret) < 32 or not token or "." not in token:
-        return None
-    encoded, signature = token.rsplit(".", 1)
-    expected = hmac.new(secret.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(signature, expected):
-        return None
-    try:
-        payload = encoded.encode("ascii")
-        payload += b"=" * (-len(payload) % 4)
-        identity = json.loads(base64.urlsafe_b64decode(payload))
-    except (ValueError, UnicodeError, json.JSONDecodeError):
-        return None
-    visitor_id = identity.get("visitor_id") if isinstance(identity, dict) else None
-    browser_context_id = identity.get("browser_context_id") if isinstance(identity, dict) else None
-    if not isinstance(visitor_id, str) or not visitor_id:
-        return None
-    if browser_context_id is not None and not isinstance(browser_context_id, str):
-        return None
-    return {"visitor_id": visitor_id, "browser_context_id": browser_context_id}
 
 
 class ControllerRegistry:
@@ -578,9 +941,11 @@ class ControllerRegistry:
             controller = self.controllers.get(visitor_id)
         return controller.snapshot() if controller else RunController().snapshot()
 
-    def start(self, visitor_id, url, auto_start, api_key, browser_context_id):
+    def start(
+        self, visitor_id, url, auto_start, api_keys, browser_context_id, mobile_number
+    ):
         with self.lock:
-            if self.active_visitor_id:
+            if not PUBLIC_MODE and self.active_visitor_id:
                 active_controller = self.controllers.get(self.active_visitor_id)
                 if active_controller and active_controller.snapshot()["worker_alive"]:
                     if self.active_visitor_id != visitor_id:
@@ -591,9 +956,9 @@ class ControllerRegistry:
             parsed = urlparse(url)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise ValueError("Enter a full http:// or https:// assignment URL.")
-            if not isinstance(api_key, str) or not api_key.strip():
-                raise ValueError("Paste your Groq API key to start.")
-            if not browser_context_id:
+            if not api_keys:
+                raise ValueError("The administrator has not configured any API keys yet.")
+            if PUBLIC_MODE and not browser_context_id:
                 browser_context_id = create_browserbase_context()
 
             controller = self.controllers.get(visitor_id)
@@ -603,14 +968,15 @@ class ControllerRegistry:
             controller.start(
                 url,
                 auto_start,
-                api_key=api_key,
+                api_keys=api_keys,
                 browser_context_id=browser_context_id,
+                mobile_number=mobile_number,
             )
-            self.active_visitor_id = visitor_id
+            if not PUBLIC_MODE:
+                self.active_visitor_id = visitor_id
             return controller, browser_context_id
 
 
-CONTROLLER = RunController()
 CONTROLLERS = ControllerRegistry()
 
 
@@ -625,117 +991,307 @@ class RequestHandler(BaseHTTPRequestHandler):
             secure = "; Secure" if PUBLIC_MODE else ""
             self.send_header(
                 "Set-Cookie",
-                f"{SESSION_COOKIE}={session_cookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000{secure}",
+                f"{SESSION_COOKIE}={session_cookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age=315360000{secure}",
             )
         self.end_headers()
         self.wfile.write(payload)
 
-    def _get_identity(self, create=False):
-        cookie = SimpleCookie()
-        try:
-            cookie.load(self.headers.get("Cookie", ""))
-        except CookieError:
-            pass
-        morsel = cookie.get(SESSION_COOKIE)
-        token = morsel.value if morsel else ""
-        identity = decode_session_cookie(token)
-        if identity:
-            return identity, None
-        if not create:
-            return None, None
-        visitor_id = secrets.token_urlsafe(24)
-        identity = {"visitor_id": visitor_id, "browser_context_id": None}
-        return identity, encode_session_cookie(visitor_id)
+    def _send_page(self, status, page):
+        payload = page.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send_cookie_expired(self):
+        secure = "; Secure" if PUBLIC_MODE else ""
+        self.send_header(
+            "Set-Cookie",
+            f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}",
+        )
+
+    def _require_admin(self, session):
+        if not session or session["role"] != "admin":
+            self._send_json(403 if session else 401, {"error": "Admin sign-in required."})
+            return False
+        return True
+
+    def _get_payload(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        if length < 0 or length > 16384:
+            raise ValueError("Request is too large.")
+        payload = json.loads(self.rfile.read(length) or b"{}")
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid request body.")
+        return payload
 
     def do_GET(self):
-        if self.path == "/api/status":
-            if PUBLIC_MODE:
-                try:
-                    identity, new_cookie = self._get_identity(create=True)
-                    status = CONTROLLERS.snapshot(identity["visitor_id"])
-                except RuntimeError as exc:
-                    self._send_json(503, {"error": str(exc)})
-                    return
-                self._send_json(
-                    200,
-                    status,
-                    session_cookie=new_cookie,
-                )
-            else:
-                self._send_json(200, CONTROLLER.snapshot())
+        try:
+            self._handle_get()
+        except RuntimeError as exc:
+            self._send_json(502, {"error": str(exc)})
+        except PoolTimeout:
+            self._send_json(503, {"error": "Database is busy; please retry shortly."})
+        except psycopg.Error as exc:
+            self._send_json(500, {"error": f"Database operation failed: {exc}."})
+        except sqlite3.Error as exc:
+            self._send_json(500, {"error": f"Database operation failed: {exc}"})
+
+    def _handle_get(self):
+        path = urlparse(self.path).path
+        session = _session_from_request(self)
+        if path == "/api/status":
+            if not session:
+                self._send_json(401, {"error": "Sign in required."})
+                return
+            status = CONTROLLERS.snapshot(session["visitor_id"])
+            status.update({
+                "username": session["username"],
+                "role": session["role"],
+            })
+            self._send_json(200, status)
             return
-        if self.path == "/":
-            payload = PAGE.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(payload)
+        if path == "/api/admin/users":
+            if not self._require_admin(session):
+                return
+            with _connect_database() as connection:
+                rows = _execute(
+                    connection,
+                    "SELECT username, date_of_birth, created_at FROM users ORDER BY created_at DESC",
+                ).fetchall()
+            self._send_json(200, {"users": [dict(row) for row in rows]})
+            return
+        if path == "/api/admin/keys":
+            if not self._require_admin(session):
+                return
+            with _connect_database() as connection:
+                rows = _execute(
+                    connection,
+                    "SELECT id, encrypted_key FROM api_keys ORDER BY id"
+                ).fetchall()
+            cipher = _key_cipher()
+            keys = []
+            for row in rows:
+                try:
+                    value = cipher.decrypt(row["encrypted_key"].encode()).decode()
+                except InvalidToken as exc:
+                    raise RuntimeError("Stored API keys cannot be decrypted; check APP_SECRET.") from exc
+                keys.append({"id": row["id"], "masked": f"••••{value[-4:]}"})
+            self._send_json(200, {"keys": keys})
+            return
+        if path in {"/", "/login"}:
+            self._send_page(200, PAGE if session else AUTH_PAGE)
+            return
+        if path == "/admin":
+            if not session:
+                self._send_page(200, AUTH_PAGE)
+            elif session["role"] != "admin":
+                self._send_page(403, "<!doctype html><meta name='viewport' content='width=device-width'><h1>Admin sign-in required</h1><a href='/'>Return to app</a>")
+            else:
+                self._send_page(200, ADMIN_PAGE)
             return
         self._send_json(404, {"error": "Not found."})
 
     def do_POST(self):
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length < 0 or length > 8192:
-                raise ValueError("Request is too large.")
-            payload = json.loads(self.rfile.read(length) or b"{}")
-            if not isinstance(payload, dict):
-                raise ValueError("Invalid request body.")
-            if self.path == "/api/start":
-                if PUBLIC_MODE:
-                    api_key = payload.get("api_key")
-                    if not isinstance(api_key, str) or not api_key.strip():
-                        raise ValueError("Paste your Groq API key to start.")
-                    identity, _ = self._get_identity(create=True)
-                    controller, browser_context_id = CONTROLLERS.start(
-                        identity["visitor_id"],
-                        str(payload.get("url", "")).strip(),
-                        bool(payload.get("auto_start", False)),
-                        api_key.strip(),
-                        identity["browser_context_id"],
-                    )
-                    session_cookie = encode_session_cookie(
-                        identity["visitor_id"],
-                        browser_context_id,
-                    )
-                    self._send_json(
-                        202,
-                        {"ok": True, "state": controller.snapshot()["state"]},
-                        session_cookie=session_cookie,
-                    )
-                else:
-                    CONTROLLER.start(
-                        str(payload.get("url", "")).strip(),
-                        bool(payload.get("auto_start", False)),
-                    )
-                    self._send_json(202, {"ok": True})
-            elif self.path == "/api/config":
-                if PUBLIC_MODE:
-                    self._send_json(
-                        403,
-                        {"error": "API key configuration is disabled in public mode."},
-                    )
-                    return
-                api_key = payload.get("api_key")
-                if not isinstance(api_key, str):
-                    raise ValueError("Enter a valid Groq API key.")
+            path = urlparse(self.path).path
+            payload = self._get_payload()
+            if path == "/api/auth/logout":
+                cookie = SimpleCookie()
                 try:
-                    save_api_key(api_key)
-                except OSError as exc:
-                    self._send_json(
-                        500,
-                        {"error": f"Could not save the key locally: {exc}"},
-                    )
+                    cookie.load(self.headers.get("Cookie", ""))
+                except CookieError:
+                    pass
+                morsel = cookie.get(SESSION_COOKIE)
+                if morsel:
+                    with _connect_database() as connection:
+                        _execute(
+                            connection,
+                            "DELETE FROM sessions WHERE token_hash = ?",
+                            (hashlib.sha256(morsel.value.encode()).hexdigest(),),
+                        )
+                        connection.commit()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self._send_cookie_expired()
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+                return
+            if path in {"/api/auth/login", "/api/auth/signup"}:
+                username = payload.get("username")
+                password = payload.get("password")
+                if not isinstance(username, str) or not isinstance(password, str):
+                    raise ValueError("Enter a username and password.")
+                username = username.strip()
+                admin_username = os.getenv("ADMIN_USERNAME", "admin").strip() or "admin"
+                if not re.fullmatch(r"[A-Za-z0-9_]{3,32}", username):
+                    raise ValueError("Username must be 3–32 letters, numbers, or underscores.")
+                role = "user"
+                if (
+                    path.endswith("/login")
+                    and hmac.compare_digest(username.casefold(), admin_username.casefold())
+                    and os.getenv("ADMIN_PASSWORD")
+                    and hmac.compare_digest(password, os.getenv("ADMIN_PASSWORD", ""))
+                ):
+                    role = "admin"
+                elif path.endswith("/signup"):
+                    if username.casefold() == admin_username.casefold():
+                        raise ValueError("That username is reserved.")
+                    username = username.casefold()
+                    if len(password) < 10:
+                        raise ValueError("Password must be at least 10 characters.")
+                    birth_date = payload.get("date_of_birth")
+                    try:
+                        if isinstance(birth_date, str) and re.fullmatch(
+                            r"\d{2}/\d{2}/\d{4}", birth_date
+                        ):
+                            parsed_birth_date = datetime.strptime(
+                                birth_date, "%m/%d/%Y"
+                            ).date()
+                        else:
+                            parsed_birth_date = date.fromisoformat(birth_date)
+                    except (TypeError, ValueError):
+                        raise ValueError("Enter a valid date of birth.")
+                    if parsed_birth_date >= date.today():
+                        raise ValueError("Date of birth must be in the past.")
+                    birth_date = parsed_birth_date.isoformat()
+                    with _connect_database() as connection:
+                        _execute(
+                            connection,
+                            """
+                            INSERT INTO users (
+                                username, date_of_birth, password_hash, created_at,
+                                visitor_id, browser_context_id
+                            ) VALUES (?, ?, ?, ?, ?, NULL)
+                            """,
+                            (
+                                username,
+                                birth_date,
+                                _password_hash(password),
+                                datetime.now().isoformat(),
+                                secrets.token_urlsafe(24),
+                            ),
+                        )
+                        connection.commit()
+                else:
+                    with _connect_database() as connection:
+                        user = _execute(
+                            connection,
+                            "SELECT username, password_hash FROM users WHERE LOWER(username) = LOWER(?)",
+                            (username,),
+                        ).fetchone()
+                    if not user or not _verify_password(password, user["password_hash"]):
+                        raise ValueError("Username or password is incorrect.")
+                    username = user["username"]
+                session_cookie = _create_session(username, role)
+                self._send_json(200, {"ok": True, "role": role}, session_cookie=session_cookie)
+                return
+
+            session = _session_from_request(self)
+            if not session:
+                self._send_json(401, {"error": "Sign in required."})
+                return
+            if path == "/api/admin/keys":
+                if not self._require_admin(session):
                     return
-                self._send_json(200, {"ok": True})
-            elif self.path == "/api/stop":
-                controller = self._get_request_controller()
+                if self.command == "POST":
+                    keys = payload.get("keys")
+                    if not isinstance(keys, list):
+                        raise ValueError("Provide API keys, one per line.")
+                    _save_api_keys(_get_api_keys() + keys)
+                    self._send_json(200, {"ok": True})
+                elif self.command == "DELETE":
+                    try:
+                        key_id = int(payload.get("id"))
+                    except (TypeError, ValueError):
+                        raise ValueError("Select a valid API key.")
+                    with _connect_database() as connection:
+                        cursor = _execute(connection, "DELETE FROM api_keys WHERE id = ?", (key_id,))
+                        connection.commit()
+                    if not cursor.rowcount:
+                        self._send_json(404, {"error": "API key not found."})
+                    else:
+                        self._send_json(200, {"ok": True})
+                else:
+                    self._send_json(405, {"error": "Method not allowed."})
+                return
+            if path == "/api/admin/users/reset-password":
+                if not self._require_admin(session):
+                    return
+                username = payload.get("username")
+                password = payload.get("new_password")
+                if not isinstance(username, str) or not isinstance(password, str):
+                    raise ValueError("Select an account and enter a new password.")
+                username = username.strip()
+                if len(password) < 10:
+                    raise ValueError("New password must be at least 10 characters.")
+                with _connect_database() as connection:
+                    cursor = _execute(
+                        connection,
+                        "UPDATE users SET password_hash = ? WHERE LOWER(username) = LOWER(?)",
+                        (_password_hash(password), username),
+                    )
+                    if cursor.rowcount:
+                        _execute(
+                            connection,
+                            "DELETE FROM sessions WHERE LOWER(username) = LOWER(?) AND role = 'user'",
+                            (username,),
+                        )
+                        connection.commit()
+                if not cursor.rowcount:
+                    self._send_json(404, {"error": "User account not found."})
+                else:
+                    self._send_json(200, {"ok": True})
+                return
+            if path == "/api/start":
+                api_keys = _get_api_keys()
+                mobile_number = payload.get("mobile_number")
+                if mobile_number is not None and not isinstance(mobile_number, str):
+                    raise ValueError("Enter a valid phone number.")
+                controller, browser_context_id = CONTROLLERS.start(
+                    session["visitor_id"],
+                    str(payload.get("url", "")).strip(),
+                    bool(payload.get("auto_start", False)),
+                    api_keys,
+                    session["browser_context_id"],
+                    mobile_number,
+                )
+                if browser_context_id != session["browser_context_id"]:
+                    with _connect_database() as connection:
+                        if session["role"] == "user":
+                            _execute(
+                                connection,
+                                """
+                                UPDATE sessions SET browser_context_id = ?
+                                WHERE LOWER(username) = LOWER(?) AND role = 'user'
+                                """,
+                                (browser_context_id, session["username"]),
+                            )
+                            _execute(
+                                connection,
+                                "UPDATE users SET browser_context_id = ? WHERE LOWER(username) = LOWER(?)",
+                                (browser_context_id, session["username"]),
+                            )
+                        else:
+                            _execute(
+                                connection,
+                                "UPDATE sessions SET browser_context_id = ? WHERE token_hash = ?",
+                                (
+                                    browser_context_id,
+                                    hashlib.sha256(self._session_token().encode()).hexdigest(),
+                                ),
+                            )
+                        connection.commit()
+                self._send_json(202, {"ok": True, "state": controller.snapshot()["state"]})
+            elif path == "/api/stop":
+                controller = self._get_request_controller(session)
                 controller.stop()
                 self._send_json(202, {"ok": True})
-            elif self.path == "/api/close":
-                controller = self._get_request_controller()
+            elif path == "/api/close":
+                controller = self._get_request_controller(session)
                 controller.close_browser()
                 self._send_json(202, {"ok": True})
             else:
@@ -744,26 +1300,47 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": str(exc)})
         except RuntimeError as exc:
             self._send_json(502, {"error": str(exc)})
+        except PoolTimeout:
+            self._send_json(503, {"error": "Database is busy; please retry shortly."})
+        except psycopg.errors.UniqueViolation:
+            self._send_json(409, {"error": "That username already exists."})
+        except sqlite3.IntegrityError:
+            self._send_json(409, {"error": "That username already exists."})
+        except psycopg.Error as exc:
+            self._send_json(500, {"error": f"Database operation failed: {exc}."})
+        except sqlite3.Error as exc:
+            self._send_json(500, {"error": f"Database operation failed: {exc}"})
 
-    def _get_request_controller(self):
-        if not PUBLIC_MODE:
-            return CONTROLLER
-        identity, _ = self._get_identity()
-        if identity is None:
-            raise ValueError("Session expired. Reload the page and try again.")
-        return CONTROLLERS.get(identity["visitor_id"])
+    def do_DELETE(self):
+        self.do_POST()
+
+    def _session_token(self):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+        except CookieError:
+            return ""
+        morsel = cookie.get(SESSION_COOKIE)
+        return morsel.value if morsel else ""
+
+    def _get_request_controller(self, session):
+        return CONTROLLERS.get(session["visitor_id"])
 
     def log_message(self, format_string, *args):
         return
 
 
 def main():
+    load_env_file()
+    if len(os.getenv("APP_SECRET", "")) < 32:
+        raise RuntimeError("Set APP_SECRET to a random value of at least 32 characters.")
+    if not os.getenv("ADMIN_PASSWORD", ""):
+        raise RuntimeError("Set ADMIN_PASSWORD to enable the administrator account.")
     if PUBLIC_MODE:
-        if len(os.getenv("APP_SECRET", "")) < 32:
-            raise RuntimeError("Set APP_SECRET to a random value of at least 32 characters.")
         if not os.getenv("BROWSERBASE_API_KEY", "").strip():
             raise RuntimeError("Set BROWSERBASE_API_KEY in the hosted service environment.")
-    load_env_file()
+    with _connect_database():
+        pass
     server = ThreadingHTTPServer((HOST, PORT), RequestHandler)
     server.daemon_threads = True
     address = f"http://{HOST}:{PORT}"
@@ -776,6 +1353,8 @@ def main():
         print("\nStopping local control page.")
     finally:
         server.server_close()
+        if DATABASE_POOL is not None:
+            DATABASE_POOL.close()
 
 
 if __name__ == "__main__":

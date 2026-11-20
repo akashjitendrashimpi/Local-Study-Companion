@@ -8,9 +8,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
-from groq import AuthenticationError, Groq
+from groq import APIConnectionError, APIStatusError, AuthenticationError, Groq
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
@@ -353,7 +353,7 @@ def print_page_diagnostics(page):
 
 def looks_like_login_page(page) -> bool:
     url = (page.url or "").lower()
-    if any(k in url for k in ["login", "signin", "sign-in", "auth", "oauth", "sso"]):
+    if any(k in url for k in ["login", "signin", "sign-in", "auth", "oauth", "sso", "otp", "verify"]):
         return True
     for scope in get_search_scopes(page):
         try:
@@ -361,6 +361,65 @@ def looks_like_login_page(page) -> bool:
                 return True
         except Exception:
             pass
+    return False
+
+
+def is_sunstone_login_page(page) -> bool:
+    parsed = urlparse(page.url or "")
+    return parsed.scheme == "https" and (parsed.hostname or "").lower().rstrip(".") in {
+        "hub.sunstone.in",
+        "www.hub.sunstone.in",
+    }
+
+
+def submit_sunstone_mobile(page, mobile_number: str) -> bool:
+    if not mobile_number or not is_sunstone_login_page(page):
+        return False
+
+    normalized_number = re.sub(r"[\s()-]", "", mobile_number)
+    phone_terms = ("phone", "mobile", "telephone", "msisdn")
+    otp_terms = ("otp", "verification code", "one time code")
+    submit_pattern = re.compile(
+        r"\b(send|get|request)\s*(otp|code)\b|\b(continue|next|login|log in|sign in)\b",
+        re.IGNORECASE,
+    )
+    for scope in get_search_scopes(page):
+        try:
+            inputs = scope.locator("input")
+            for index in range(inputs.count()):
+                field = inputs.nth(index)
+                if not field.is_visible() or not field.is_enabled():
+                    continue
+                metadata = " ".join(
+                    field.get_attribute(attribute) or ""
+                    for attribute in ("aria-label", "placeholder", "name", "autocomplete", "type")
+                ).lower()
+                if any(term in metadata for term in otp_terms):
+                    continue
+                if not (
+                    any(term in metadata for term in phone_terms)
+                    or (field.get_attribute("type") or "").lower() == "tel"
+                ):
+                    continue
+                field.fill(normalized_number, timeout=3000)
+                buttons = scope.locator("button, [role='button']")
+                for button_index in range(buttons.count()):
+                    button = buttons.nth(button_index)
+                    if not button.is_visible() or not button.is_enabled():
+                        continue
+                    label = " ".join(
+                        (
+                            button.inner_text(timeout=500) or "",
+                            button.get_attribute("aria-label") or "",
+                        )
+                    )
+                    if submit_pattern.search(label):
+                        button.click(timeout=3000)
+                        return True
+                field.press("Enter", timeout=3000)
+                return True
+        except PlaywrightError:
+            continue
     return False
 
 
@@ -849,6 +908,8 @@ def run_automation(
     keep_browser_open: bool = False,
     api_key: str | None = None,
     browser_context_id: str | None = None,
+    api_keys: list[str] | None = None,
+    mobile_number: str = "",
 ) -> str:
     stop_event = stop_event or threading.Event()
 
@@ -867,11 +928,17 @@ def run_automation(
     target_url = target_url.strip()
     if not target_url.startswith(("http://", "https://")):
         target_url = "https://" + target_url
-    api_key = (api_key or "").strip() or get_api_key(allow_prompt=False)
+    configured_keys = [
+        key.strip() for key in (api_keys or [api_key or ""]) if key and key.strip()
+    ]
+    if not configured_keys:
+        configured_keys = [get_api_key(allow_prompt=False)]
     if not target_url.startswith(("http://", "https://")):
         raise ValueError("Enter a valid http:// or https:// URL.")
 
-    client = Groq(api_key=api_key)
+    clients = [Groq(api_key=key) for key in configured_keys]
+    active_key_index = 0
+    rejected_key_indices = set()
     model_name = GROQ_MODEL
     terminal_status = "running"
 
@@ -893,7 +960,17 @@ def run_automation(
             page = get_active_page(context)
 
             if looks_like_login_page(page):
-                report("login_required", "Complete sign-in in the browser; waiting here.")
+                phone_submitted = submit_sunstone_mobile(page, mobile_number)
+                if phone_submitted:
+                    report(
+                        "login_required",
+                        "Phone submitted to Sunstone. Enter the OTP in its browser page; the app does not collect it.",
+                    )
+                else:
+                    report(
+                        "login_required",
+                        "Complete sign-in in the browser; enter any OTP on the site itself.",
+                    )
                 while not stop_event.is_set() and looks_like_login_page(page):
                     stop_event.wait(0.25)
                     page = get_open_page(context)
@@ -963,20 +1040,78 @@ def run_automation(
                 )
 
                 decision = None
-                for request_attempt in range(3):
+                failed_key_indices = set()
+                for request_attempt in range(len(clients) + 2):
                     if stop_event.is_set():
                         break
                     try:
-                        decision = ask_groq(client, model_name, page_text, options, text_fields)
+                        decision = ask_groq(
+                            clients[active_key_index],
+                            model_name,
+                            page_text,
+                            options,
+                            text_fields,
+                        )
                         break
                     except AuthenticationError:
+                        rejected_key_indices.add(active_key_index)
+                        failed_key_indices.add(active_key_index)
+                        next_key_index = next(
+                            (
+                                index for index in range(len(clients))
+                                if index not in failed_key_indices
+                            ),
+                            None,
+                        )
+                        if next_key_index is None:
+                            if len(rejected_key_indices) == len(clients):
+                                report(
+                                    "api_key_rejected",
+                                    "All configured Groq API keys were rejected.",
+                                    question_number,
+                                )
+                                terminal_status = "api_key_rejected"
+                            else:
+                                report(
+                                    "failed",
+                                    "Groq rejected a key and no other working keys remain.",
+                                    question_number,
+                                )
+                                terminal_status = "failed"
+                            break
+                        active_key_index = next_key_index
                         report(
-                            "api_key_rejected",
-                            "Groq rejected your API key. Replace the saved key above, then start again.",
+                            "retrying",
+                            "A Groq key was rejected; switching to another configured key.",
                             question_number,
                         )
-                        terminal_status = "api_key_rejected"
-                        break
+                    except (APIConnectionError, APIStatusError) as exc:
+                        failed_key_indices.add(active_key_index)
+                        remaining_key_indices = [
+                            index for index in range(len(clients))
+                            if index not in failed_key_indices
+                        ]
+                        if remaining_key_indices:
+                            active_key_index = remaining_key_indices[0]
+                            report(
+                                "retrying",
+                                "Groq request failed; switching to another configured key.",
+                                question_number,
+                            )
+                        elif request_attempt >= len(clients) + 1:
+                            report(
+                                "failed",
+                                f"Groq request failed after trying the configured keys: {type(exc).__name__}.",
+                                question_number,
+                            )
+                            terminal_status = "failed"
+                        else:
+                            report(
+                                "retrying",
+                                "Temporary Groq service error; retrying.",
+                                question_number,
+                            )
+                            stop_event.wait(0.4 * (request_attempt + 1))
                     except Exception as exc:
                         if request_attempt == 2:
                             report("failed", f"Groq request failed after 3 tries: {exc}", question_number)

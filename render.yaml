@@ -10,3 +10,9 @@ services:
         sync: false
       - key: APP_SECRET
         sync: false
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: SUPABASE_DATABASE_URL
+        sync: false

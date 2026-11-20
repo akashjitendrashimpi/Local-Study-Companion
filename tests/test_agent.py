@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import httpx
-from groq import AuthenticationError
+from groq import APIStatusError, AuthenticationError
 from playwright.sync_api import Error as PlaywrightError
 
 from agent import (
@@ -18,8 +18,10 @@ from agent import (
     load_env_file,
     ask_groq,
     click_next_question,
+    is_sunstone_login_page,
     main,
     run_automation,
+    submit_sunstone_mobile,
     wait_for_question_state,
 )
 
@@ -74,6 +76,42 @@ class AgentHelperTests(unittest.TestCase):
         self.assertTrue(is_navigation_option("Question 27"))
         self.assertTrue(is_navigation_option("Mark for review"))
         self.assertFalse(is_navigation_option("D 180"))
+
+    def test_sunstone_phone_autofill_is_domain_scoped_and_leaves_otp_on_site(self):
+        page = Mock()
+        page.url = "https://www.hub.sunstone.in/#/login"
+        page.frames = []
+        page.main_frame = object()
+        field = Mock()
+        field.is_visible.return_value = True
+        field.is_enabled.return_value = True
+        field.get_attribute.side_effect = lambda name: {
+            "aria-label": "Mobile number",
+            "placeholder": "Enter mobile number",
+            "type": "text",
+        }.get(name)
+        field_locator = Mock()
+        field_locator.count.return_value = 1
+        field_locator.nth.return_value = field
+        button = Mock()
+        button.is_visible.return_value = True
+        button.is_enabled.return_value = True
+        button.inner_text.return_value = "Send OTP"
+        button.get_attribute.return_value = None
+        button_locator = Mock()
+        button_locator.count.return_value = 1
+        button_locator.nth.return_value = button
+        page.locator.side_effect = lambda selector: (
+            field_locator if selector == "input" else button_locator
+        )
+
+        self.assertTrue(is_sunstone_login_page(page))
+        self.assertTrue(submit_sunstone_mobile(page, "+91 98765 43210"))
+        field.fill.assert_called_once_with("+919876543210", timeout=3000)
+        button.click.assert_called_once_with(timeout=3000)
+
+        page.url = "https://example.test/login"
+        self.assertFalse(submit_sunstone_mobile(page, "9876543210"))
 
     def test_extracts_question_progress(self):
         self.assertEqual(extract_progress_info("Question 7 of 30"), (7, 30))
@@ -235,6 +273,53 @@ class AgentHelperTests(unittest.TestCase):
         self.assertEqual(ask_groq.call_count, 1)
         self.assertIn("api_key_rejected", [event["status"] for event in events])
         self.assertNotIn("awaiting_close", [event["status"] for event in events])
+
+    def test_api_failure_switches_key_and_retries_current_question(self):
+        response = httpx.Response(
+            503,
+            request=httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
+        )
+        service_error = APIStatusError("Service unavailable", response=response, body=None)
+        page = Mock()
+        page.url = "https://example.test/assignment"
+        events = []
+        close_event = threading.Event()
+        close_event.set()
+        first_client = Mock()
+        second_client = Mock()
+
+        @contextmanager
+        def fake_browser_context(**kwargs):
+            yield object()
+
+        with patch("agent.Groq", side_effect=[first_client, second_client]), patch(
+            "agent.launch_browser_context", side_effect=fake_browser_context
+        ), patch("agent.get_active_page", return_value=page), patch(
+            "agent.get_open_page", return_value=page
+        ), patch("agent.wait_until_loaded", return_value=True), patch(
+            "agent.looks_like_login_page", return_value=False
+        ), patch(
+            "agent.wait_for_question_state",
+            return_value=("Question 1\nChoose one.", ["A"], []),
+        ), patch("agent.ask_groq", side_effect=[
+            service_error,
+            {"exact_option": "A", "text_answers": [], "next_button": "Submit"},
+        ]) as ask_groq, patch("agent.click_exact_option", return_value=True), patch(
+            "agent.verify_option_selected", return_value=True
+        ):
+            result = run_automation(
+                "https://example.test/assignment",
+                on_event=events.append,
+                close_event=close_event,
+                keep_browser_open=True,
+                api_keys=["first-key", "second-key"],
+            )
+
+        self.assertEqual(result, "awaiting_submission")
+        self.assertEqual(ask_groq.call_count, 2)
+        self.assertIs(ask_groq.call_args_list[0].args[0], first_client)
+        self.assertIs(ask_groq.call_args_list[1].args[0], second_client)
+        self.assertTrue(any("switching to another configured key" in event["message"] for event in events))
 
     @patch("agent.time.sleep")
     @patch("agent.sync_playwright")
