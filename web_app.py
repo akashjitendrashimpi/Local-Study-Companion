@@ -10,8 +10,9 @@ from urllib.parse import urlparse
 
 from agent import load_env_file, run_automation
 
-HOST = "127.0.0.1"
-PORT = 8765
+HOST = os.getenv("HOST", "127.0.0.1")
+PORT = int(os.getenv("PORT", "8765"))
+PUBLIC_MODE = os.getenv("PUBLIC_MODE", "").strip().lower() in {"1", "true", "yes"}
 ENV_FILE_PATH = Path(__file__).with_name(".env")
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -236,9 +237,14 @@ PAGE = r"""<!doctype html>
       if (!data.api_key_configured) {
         message.textContent = "Save your Groq key above to enable Start.";
       }
+      if (data.public_mode) {
+        keyForm.closest(".card").style.display = "none";
+      }
       if (!keyStatusEdited) {
         keyStatus.textContent = data.api_key_configured
-          ? "A key is saved on this computer. Paste another one above to replace it."
+          ? (data.public_mode
+            ? "The hosted Groq key is configured."
+            : "A key is saved on this computer. Paste another one above to replace it.")
           : "Add it once here; you won’t need to re-enter it each time.";
       }
     } catch (_) {
@@ -347,7 +353,7 @@ class RunController:
                 stop_event=stop_event,
                 close_event=self.close_event,
                 auto_start=auto_start,
-                keep_browser_open=True,
+                keep_browser_open=not PUBLIC_MODE,
             )
             self.report({
                 "status": result,
@@ -397,6 +403,7 @@ class RunController:
                 "api_key_configured": bool(os.environ.get("GROQ_API_KEY", "").strip()),
                 "worker_alive": worker_alive,
                 "close_available": worker_alive and self.state["state"] == "awaiting_close",
+                "public_mode": PUBLIC_MODE,
             }
 
 
@@ -443,6 +450,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 )
                 self._send_json(202, {"ok": True})
             elif self.path == "/api/config":
+                if PUBLIC_MODE:
+                    self._send_json(
+                        403,
+                        {"error": "API key configuration is disabled in public mode."},
+                    )
+                    return
                 api_key = payload.get("api_key")
                 if not isinstance(api_key, str):
                     raise ValueError("Enter a valid Groq API key.")

@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: local-study-companion
+    runtime: docker
+    plan: free
+    envVars:
+      - key: PUBLIC_MODE
+        value: true
+      - key: BROWSER_HEADLESS
+        value: true
+      - key: GROQ_API_KEY
+        sync: false

@@ -28,3 +28,15 @@ Use **Stop** in the page to request a safe stop. Model/API calls may take a few 
 The existing command-line entry point remains available with `python agent.py`. It waits at the end so you can review the assignment in Chrome and submit it yourself if ready; press ENTER in the terminal only when you want to close Chrome.
 
 The command-line runner and dashboard use the same `browser_profile`, so do not run them at the same time. To pick up code changes, stop an already-running dashboard with Ctrl+C and restart it with `python web_app.py`.
+
+## Deploy on Render
+
+The app can be hosted with Render's Docker service:
+
+1. Push this repository to GitHub.
+2. In Render, create a new Web Service from the repository.
+3. Select **Docker** as the runtime.
+4. Set `GROQ_API_KEY` to a Groq API key in Render's environment settings.
+5. Deploy. Visitors only enter an assignment URL.
+
+In public mode, the app hides the API-key form and runs Chromium headlessly with a fresh temporary browser profile. It cannot preserve a visitor's login or reuse `browser_profile` cookies; assignments that require authentication must be run locally. The free Render plan may also spin down or run out of resources during automation.

@@ -2,6 +2,7 @@ import getpass
 import json
 import os
 import re
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -126,14 +127,23 @@ def get_active_page(context):
 
 @contextmanager
 def launch_browser_context():
+    public_mode = os.getenv("PUBLIC_MODE", "").strip().lower() in {"1", "true", "yes"}
+    headless = os.getenv("BROWSER_HEADLESS", "").strip().lower() in {"1", "true", "yes"}
+    profile_dir = USER_DATA_DIR
+    temporary_profile = None
+    if public_mode:
+        temporary_profile = tempfile.TemporaryDirectory(prefix="quiz-browser-")
+        profile_dir = temporary_profile.name
+        headless = True
+
     for attempt in range(2):
         manager = sync_playwright()
         playwright = None
         try:
             playwright = manager.start()
             context = playwright.chromium.launch_persistent_context(
-                user_data_dir=USER_DATA_DIR,
-                headless=False,
+                user_data_dir=profile_dir,
+                headless=headless,
                 args=["--disable-blink-features=AutomationControlled"],
                 timeout=30000,
             )
@@ -161,6 +171,8 @@ def launch_browser_context():
             except PlaywrightError:
                 pass
             playwright.stop()
+        if temporary_profile is not None:
+            temporary_profile.cleanup()
         return
 
 
