@@ -33,6 +33,12 @@ def load_env_file(path: Path | None = None) -> None:
 load_env_file()
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_MODEL = os.environ.get("GROQ_MODEL", DEFAULT_GROQ_MODEL).strip() or DEFAULT_GROQ_MODEL
+STRICT_JSON_MODELS = {
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
+    "meta-models/muse-spark-open",
+}
 USER_DATA_DIR = str(Path(__file__).with_name("browser_profile"))
 
 START_TRIGGERS = [
@@ -510,6 +516,7 @@ Rules:
 - For text-entry questions, return "text_answers" as an array with one answer per TEXT_FIELDS item, in the same order.
 - Do not include an answer for a field that is not part of the question.
 - "next_button" is ONLY the button text that advances to the next question (e.g., "Next", "Save & Next", "Continue").
+- Use an empty string for "next_button" if no next action is visible.
 
 OPTIONS:
 {json.dumps(options, indent=2)}
@@ -527,16 +534,52 @@ Respond ONLY with valid JSON:
   "next_button": "Next"
 }}
 """
-    res = client.chat.completions.create(
-        model=model_name,
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-        temperature=0,
-        timeout=25.0,
-    )
-    data = json.loads(res.choices[0].message.content or "")
+    request_args = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "timeout": 25.0,
+    }
+    if model_name in STRICT_JSON_MODELS:
+        request_args["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "quiz_answer",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "exact_option": {"type": "string"},
+                        "text_answers": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "next_button": {"type": "string"},
+                    },
+                    "required": ["exact_option", "text_answers", "next_button"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    res = client.chat.completions.create(**request_args)
+    content = (res.choices[0].message.content or "").strip()
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        object_start = content.find("{")
+        if object_start < 0:
+            raise ValueError("Model did not return valid JSON.")
+        data, _ = json.JSONDecoder().raw_decode(content[object_start:])
     if not isinstance(data, dict):
         raise ValueError("Model did not return a JSON object.")
+    if (
+        not isinstance(data.get("exact_option"), str)
+        or not isinstance(data.get("text_answers"), list)
+        or any(not isinstance(answer, str) for answer in data["text_answers"])
+        or not isinstance(data.get("next_button"), str)
+    ):
+        raise ValueError("Model response did not match the expected answer fields.")
     return data
 
 

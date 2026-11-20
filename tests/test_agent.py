@@ -4,6 +4,7 @@ import threading
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import httpx
 from groq import AuthenticationError
@@ -15,6 +16,7 @@ from agent import (
     is_navigation_option,
     launch_browser_context,
     load_env_file,
+    ask_groq,
     click_next_question,
     main,
     run_automation,
@@ -76,6 +78,48 @@ class AgentHelperTests(unittest.TestCase):
     def test_extracts_question_progress(self):
         self.assertEqual(extract_progress_info("Question 7 of 30"), (7, 30))
         self.assertEqual(extract_progress_info("No progress"), (None, None))
+
+    def test_default_groq_model_uses_strict_schema_and_parses_answers(self):
+        client = Mock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"exact_option":"A","text_answers":[],"next_button":"Next"}'
+                    )
+                )
+            ]
+        )
+
+        result = ask_groq(client, "openai/gpt-oss-20b", "Question?", ["A"], [])
+
+        response_format = client.chat.completions.create.call_args.kwargs["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertTrue(response_format["json_schema"]["strict"])
+        self.assertEqual(result["exact_option"], "A")
+
+    def test_custom_model_parses_fenced_json_without_json_mode(self):
+        client = Mock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            'Answer:\n```json\n'
+                            '{"exact_option":"","text_answers":["42"],"next_button":""}\n```'
+                        )
+                    )
+                )
+            ]
+        )
+
+        result = ask_groq(client, "custom/model", "Question?", [], [{"label": "Answer", "value": ""}])
+
+        self.assertEqual(result["text_answers"], ["42"])
+        self.assertNotIn(
+            "response_format",
+            client.chat.completions.create.call_args.kwargs,
+        )
 
     def test_env_file_load_preserves_existing_environment(self):
         with tempfile.TemporaryDirectory() as directory:
