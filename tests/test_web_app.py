@@ -9,10 +9,38 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 from unittest.mock import patch
 
-from web_app import RequestHandler, RunController, save_api_key
+from web_app import (
+    CONTROLLERS,
+    RequestHandler,
+    RunController,
+    decode_session_cookie,
+    encode_session_cookie,
+    save_api_key,
+)
 
 
 class RunControllerTests(unittest.TestCase):
+    def test_signed_visitor_cookie_rejects_tampering(self):
+        with patch.dict(os.environ, {"APP_SECRET": "x" * 40}):
+            token = encode_session_cookie("visitor-1", "context-1")
+            self.assertEqual(
+                decode_session_cookie(token),
+                {"visitor_id": "visitor-1", "browser_context_id": "context-1"},
+            )
+            tampered = token[:-1] + ("0" if token[-1] != "0" else "1")
+            self.assertIsNone(decode_session_cookie(tampered))
+
+    def test_visitor_controllers_are_isolated(self):
+        first = CONTROLLERS.get("test-visitor-one")
+        second = CONTROLLERS.get("test-visitor-two")
+        first.report({"status": "waiting", "message": "Private run state."})
+
+        self.assertNotEqual(first.snapshot()["message"], second.snapshot()["message"])
+        self.assertNotIn(
+            "Private run state.",
+            json.dumps(second.snapshot()),
+        )
+
     def test_rejects_non_web_url(self):
         controller = RunController()
         with patch.dict(os.environ, {"GROQ_API_KEY": "test-key"}):
@@ -22,7 +50,16 @@ class RunControllerTests(unittest.TestCase):
     def test_start_runs_worker_and_reports_completion(self):
         controller = RunController()
 
-        def fake_run(url, on_event, stop_event, close_event, auto_start, keep_browser_open):
+        def fake_run(
+            url,
+            on_event,
+            stop_event,
+            close_event,
+            auto_start,
+            keep_browser_open,
+            api_key,
+            browser_context_id,
+        ):
             on_event({
                 "status": "completed",
                 "message": "Test run completed.",
@@ -40,6 +77,38 @@ class RunControllerTests(unittest.TestCase):
         self.assertEqual(status["state"], "completed")
         self.assertEqual(status["question"], 2)
         self.assertTrue(status["api_key_configured"])
+
+    def test_public_run_uses_visitor_key_without_exposing_it_in_status(self):
+        controller = RunController()
+        received_keys = []
+
+        def fake_run(
+            url,
+            on_event,
+            stop_event,
+            close_event,
+            auto_start,
+            keep_browser_open,
+            api_key,
+            browser_context_id,
+        ):
+            received_keys.append(api_key)
+            on_event({"status": "completed", "message": "Run completed."})
+            return "completed"
+
+        with patch("web_app.PUBLIC_MODE", True), patch(
+            "web_app.run_automation", side_effect=fake_run
+        ):
+            controller.start(
+                "https://example.test/assignment",
+                False,
+                api_key="visitor-secret-key",
+                browser_context_id="visitor-context",
+            )
+            controller.worker.join(timeout=2)
+
+        self.assertEqual(received_keys, ["visitor-secret-key"])
+        self.assertNotIn("visitor-secret-key", json.dumps(controller.snapshot()))
 
     def test_local_http_routes_serve_ui_and_status(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), RequestHandler)
@@ -59,6 +128,39 @@ class RunControllerTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertIn("api_key_configured", status)
                 self.assertNotIn("GROQ_API_KEY", json.dumps(status))
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2)
+
+    def test_public_status_is_scoped_to_signed_visitor_cookie(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), RequestHandler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            with patch("web_app.PUBLIC_MODE", True), patch.dict(
+                os.environ, {"APP_SECRET": "test-secret-value-" * 3}
+            ):
+                with urlopen(f"{base_url}/api/status", timeout=2) as response:
+                    first_status = json.loads(response.read())
+                    cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+                identity = decode_session_cookie(cookie.split("=", 1)[1])
+                self.assertTrue(first_status["public_mode"])
+                CONTROLLERS.get(identity["visitor_id"]).report({
+                    "status": "waiting",
+                    "message": "First visitor only.",
+                })
+
+                request = Request(f"{base_url}/api/status", headers={"Cookie": cookie})
+                with urlopen(request, timeout=2) as response:
+                    same_visitor_status = json.loads(response.read())
+                with urlopen(f"{base_url}/api/status", timeout=2) as response:
+                    other_visitor_status = json.loads(response.read())
+
+                self.assertEqual(same_visitor_status["message"], "First visitor only.")
+                self.assertEqual(other_visitor_status["state"], "idle")
+                self.assertNotIn("First visitor only.", json.dumps(other_visitor_status))
         finally:
             server.shutdown()
             server.server_close()
@@ -115,7 +217,16 @@ class RunControllerTests(unittest.TestCase):
     def test_browser_close_action_releases_waiting_worker(self):
         controller = RunController()
 
-        def fake_run(url, on_event, stop_event, close_event, auto_start, keep_browser_open):
+        def fake_run(
+            url,
+            on_event,
+            stop_event,
+            close_event,
+            auto_start,
+            keep_browser_open,
+            api_key,
+            browser_context_id,
+        ):
             on_event({"status": "awaiting_close", "message": "Browser remains open."})
             close_event.wait(timeout=2)
             return "awaiting_submission"

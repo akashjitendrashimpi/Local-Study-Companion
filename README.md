@@ -36,7 +36,7 @@ The app can be hosted with Render's Docker service:
 1. Push this repository to GitHub.
 2. In Render, create a new Web Service from the repository.
 3. Select **Docker** as the runtime.
-4. Set `GROQ_API_KEY` to a Groq API key in Render's environment settings.
-5. Deploy. Visitors only enter an assignment URL.
+4. In Render's environment settings, set `BROWSERBASE_API_KEY` from your Browserbase account and `APP_SECRET`. Generate the secret locally with `python -c "import secrets; print(secrets.token_urlsafe(32))"`; do not share it.
+5. Deploy. Each visitor enters their own Groq API key and assignment URL.
 
-In public mode, the app hides the API-key form and runs Chromium headlessly with a fresh temporary browser profile. It cannot preserve a visitor's login or reuse `browser_profile` cookies; assignments that require authentication must be run locally. The free Render plan may also spin down or run out of resources during automation.
+In public mode, Browserbase provides a live browser view inside the page. Each visitor's sign-in is kept in an isolated persistent Browserbase context, associated with a signed, HttpOnly cookie in that visitor's browser. The sign-in is stored in Browserbase's cloud, not on the visitor's device. Each visitor supplies their own Groq API key; the app uses it for the run without saving it. Browser sessions are limited to one visitor at a time, and Browserbase usage is billed to your Browserbase account. Do not share the Browserbase API key or `APP_SECRET`.

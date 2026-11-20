@@ -114,6 +114,42 @@ class AgentHelperTests(unittest.TestCase):
         context.close.assert_called_once_with()
         playwright.stop.assert_called_once_with()
 
+    @patch("agent.browserbase_request")
+    @patch("agent.sync_playwright")
+    def test_public_browser_context_connects_and_reports_live_view(
+        self, sync_playwright, browserbase_request
+    ):
+        manager = Mock()
+        playwright = Mock()
+        browser = Mock()
+        context = Mock()
+        browser.contexts = [context]
+        manager.start.return_value = playwright
+        playwright.chromium.connect_over_cdp.return_value = browser
+        sync_playwright.return_value = manager
+        browserbase_request.side_effect = [
+            {"id": "session-id", "connectUrl": "wss://connect.browserbase.com"},
+            {"debuggerFullscreenUrl": "https://debug.browserbase.com/live"},
+        ]
+        events = []
+
+        with patch.dict(os.environ, {"PUBLIC_MODE": "true"}):
+            with launch_browser_context(
+                on_event=events.append,
+                browser_context_id="context-id",
+            ) as launched_context:
+                self.assertIs(launched_context, context)
+
+        session_payload = browserbase_request.call_args_list[0].kwargs["payload"]
+        self.assertEqual(
+            session_payload["browserSettings"]["context"],
+            {"id": "context-id", "persist": True},
+        )
+        self.assertFalse(session_payload["browserSettings"]["recordSession"])
+        self.assertEqual(events[0]["live_view_url"], "https://debug.browserbase.com/live")
+        browser.close.assert_called_once_with()
+        playwright.stop.assert_called_once_with()
+
     @patch("agent.time.sleep")
     @patch("agent.sync_playwright")
     def test_browser_context_retries_driver_disconnect_once(

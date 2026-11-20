@@ -2,12 +2,14 @@ import getpass
 import json
 import os
 import re
-import tempfile
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 from groq import Groq
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
@@ -125,16 +127,99 @@ def get_active_page(context):
     return get_open_page(context) or context.new_page()
 
 
+def browserbase_request(path: str, method: str = "GET", payload: dict | None = None) -> dict:
+    api_key = os.getenv("BROWSERBASE_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Set BROWSERBASE_API_KEY in the hosted service environment.")
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"X-BB-API-Key": api_key}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    request = Request(
+        f"https://api.browserbase.com/v1{path}",
+        data=body,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Browserbase API request failed ({exc.code}): {detail[:500]}"
+        ) from exc
+    except URLError as exc:
+        raise RuntimeError(f"Could not reach Browserbase: {exc.reason}") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("Browserbase returned an invalid response.")
+    return result
+
+
+def create_browserbase_context() -> str:
+    result = browserbase_request("/contexts", method="POST", payload={})
+    context_id = result.get("id")
+    if not isinstance(context_id, str) or not context_id:
+        raise RuntimeError("Browserbase did not return a browser context ID.")
+    return context_id
+
+
 @contextmanager
-def launch_browser_context():
+def launch_browser_context(on_event=None, browser_context_id: str | None = None):
     public_mode = os.getenv("PUBLIC_MODE", "").strip().lower() in {"1", "true", "yes"}
     headless = os.getenv("BROWSER_HEADLESS", "").strip().lower() in {"1", "true", "yes"}
-    profile_dir = USER_DATA_DIR
-    temporary_profile = None
     if public_mode:
-        temporary_profile = tempfile.TemporaryDirectory(prefix="quiz-browser-")
-        profile_dir = temporary_profile.name
-        headless = True
+        if not browser_context_id:
+            raise RuntimeError("A visitor browser context is required in public mode.")
+        manager = sync_playwright()
+        playwright = manager.start()
+        browser = None
+        try:
+            session = browserbase_request(
+                "/sessions",
+                method="POST",
+                payload={
+                    "timeout": 3600,
+                    "browserSettings": {
+                        "context": {"id": browser_context_id, "persist": True},
+                        "viewport": {"width": 1280, "height": 900},
+                        "recordSession": False,
+                        "logSession": False,
+                    },
+                },
+            )
+            session_id = session.get("id")
+            connect_url = session.get("connectUrl")
+            if not isinstance(session_id, str) or not isinstance(connect_url, str):
+                raise RuntimeError("Browserbase did not return session connection details.")
+
+            browser = playwright.chromium.connect_over_cdp(connect_url)
+            contexts = browser.contexts
+            if not contexts:
+                raise RuntimeError("Browserbase session has no browser context.")
+            context = contexts[0]
+
+            live_view = browserbase_request(
+                f"/sessions/{quote(session_id, safe='')}/debug"
+            ).get("debuggerFullscreenUrl")
+            if not isinstance(live_view, str) or not live_view.startswith("https://"):
+                raise RuntimeError("Browserbase did not return a valid live-view URL.")
+            if on_event:
+                on_event({
+                    "status": "starting",
+                    "message": "Remote browser is ready. Sign in using the browser view below.",
+                    "live_view_url": live_view,
+                })
+            yield context
+        finally:
+            try:
+                if browser is not None:
+                    browser.close()
+            finally:
+                playwright.stop()
+        return
+
+    profile_dir = USER_DATA_DIR
 
     for attempt in range(2):
         manager = sync_playwright()
@@ -171,8 +256,6 @@ def launch_browser_context():
             except PlaywrightError:
                 pass
             playwright.stop()
-        if temporary_profile is not None:
-            temporary_profile.cleanup()
         return
 
 
@@ -722,6 +805,7 @@ def run_automation(
     auto_start: bool = False,
     keep_browser_open: bool = False,
     api_key: str | None = None,
+    browser_context_id: str | None = None,
 ) -> str:
     stop_event = stop_event or threading.Event()
 
@@ -750,7 +834,10 @@ def run_automation(
 
     try:
         report("starting", "Starting the Playwright browser driver.")
-        with launch_browser_context() as context:
+        with launch_browser_context(
+            on_event=on_event,
+            browser_context_id=browser_context_id,
+        ) as context:
             page = get_active_page(context)
             report("starting", f"Opening {target_url}")
 

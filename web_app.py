@@ -1,18 +1,24 @@
+import base64
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import threading
 import webbrowser
 from collections import deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from http.cookies import CookieError, SimpleCookie
 from urllib.parse import urlparse
 
-from agent import load_env_file, run_automation
+from agent import create_browserbase_context, load_env_file, run_automation
 
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8765"))
 PUBLIC_MODE = os.getenv("PUBLIC_MODE", "").strip().lower() in {"1", "true", "yes"}
+SESSION_COOKIE = "quiz_session"
 ENV_FILE_PATH = Path(__file__).with_name(".env")
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -55,6 +61,8 @@ PAGE = r"""<!doctype html>
     #message { margin: 16px 0 0; line-height: 1.5; color: #4e5b72; overflow-wrap: anywhere; }
     #progress { margin-top: 8px; font-size: .9rem; color: #768197; }
     .notice { padding: 12px 14px; background: #fff8e8; border: 1px solid #f3e4bc; border-radius: 10px; color: #6a5421; font-size: .86rem; line-height: 1.5; margin-top: 18px; }
+    .public-only { display: none; }
+    .browser-view { width: 100%; aspect-ratio: 16 / 10; border: 1px solid #dce2ed; border-radius: 10px; background: #111827; }
     h2 { font-size: 1rem; margin: 0 0 12px; }
     #logs { margin: 0; padding: 0; list-style: none; max-height: 230px; overflow: auto; }
     #logs li { padding: 9px 0; border-top: 1px solid #edf0f5; color: #5e6a7e; font-size: .86rem; line-height: 1.4; overflow-wrap: anywhere; }
@@ -71,7 +79,7 @@ PAGE = r"""<!doctype html>
       <h1>Quiz Assistant</h1>
       <span class="byline">Made by Akash</span>
     </div>
-    <p>Your local companion for working in a separate browser window. Sign in there if needed; your browser session stays on this computer.</p>
+    <p id="intro">Your local companion for working in a separate browser window. Sign in there if needed; your browser session stays on this computer.</p>
   </header>
   <section class="card">
     <h2>One-time setup (Go to https://groq.com -> API Keys -> Create API Key -> Copy it -> Paste it here)</h2>
@@ -87,19 +95,32 @@ PAGE = r"""<!doctype html>
   </section>
   <section class="card">
     <form id="start-form">
+      <div id="public-key-row" class="public-only">
+        <label for="groq-key">Your Groq API key</label>
+        <input id="groq-key" name="groq-key" type="password" placeholder="Paste your Groq API key" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <p class="hint">Sent over HTTPS for this run only; this website does not save it.</p>
+      </div>
       <label for="url">Assignment URL (Note - This will only work for MCQ's only)</label>
       <input id="url" name="url" type="url" placeholder="https://example.com/assignment" required>
-      <p class="hint">The automation uses the local <code>browser_profile</code> and never uploads your browser session.</p>
+      <p id="browser-hint" class="hint">The automation uses the local <code>browser_profile</code> and never uploads your browser session.</p>
       <label class="check">
         <input id="auto-start" type="checkbox">
         <span>Click the assignment’s Start button automatically. Leave unchecked to start it yourself in the browser.</span>
       </label>
       <div class="actions">
-        <button id="start" class="primary" type="submit">Start</button>
+        <button id="start" class="primary" type="submit" disabled>Start</button>
         <button id="stop" class="secondary" type="button" disabled>Stop</button>
       </div>
     </form>
-    <div class="notice">It stops before final submission. Review and submit manually in Chrome; the browser stays open until you click Close browser. Starting an assignment may use an attempt; confirm you’re allowed to automate it.</div>
+    <div id="run-notice" class="notice">It stops before final submission. Review and submit manually in Chrome; the browser stays open until you click Close browser. Starting an assignment may use an attempt; confirm you’re allowed to automate it.</div>
+  </section>
+  <section id="browser-view-card" class="card public-only">
+    <div class="status-row">
+      <h2>Remote browser</h2>
+      <a id="open-browser-view" class="hint" href="#" target="_blank" rel="noopener noreferrer">Open in new tab</a>
+    </div>
+    <p class="hint">Sign in here if needed. This visitor’s browser session is kept in an isolated hosted context.</p>
+    <iframe id="browser-view" class="browser-view" title="Remote browser live view" sandbox="allow-same-origin allow-scripts" allow="clipboard-read; clipboard-write"></iframe>
   </section>
   <section class="card" aria-live="polite">
     <div class="status-row">
@@ -127,6 +148,11 @@ PAGE = r"""<!doctype html>
   const startButton = document.querySelector("#start");
   const stopButton = document.querySelector("#stop");
   const closeButton = document.querySelector("#close-browser");
+  const publicKeyRow = document.querySelector("#public-key-row");
+  const publicKeyInput = document.querySelector("#groq-key");
+  const browserViewCard = document.querySelector("#browser-view-card");
+  const browserView = document.querySelector("#browser-view");
+  const openBrowserView = document.querySelector("#open-browser-view");
   const badge = document.querySelector("#badge");
   const stateLabel = document.querySelector("#state");
   const message = document.querySelector("#message");
@@ -134,6 +160,7 @@ PAGE = r"""<!doctype html>
   const logs = document.querySelector("#logs");
   let lastLogCount = -1;
   let keyStatusEdited = false;
+  let publicMode = false;
   const labels = {
     idle: "Idle", starting: "Starting", navigating: "Opening browser",
     login_required: "Sign in required", waiting: "Waiting",
@@ -179,8 +206,10 @@ PAGE = r"""<!doctype html>
     try {
       await send("/api/start", {
         url: document.querySelector("#url").value.trim(),
-        auto_start: document.querySelector("#auto-start").checked
+        auto_start: document.querySelector("#auto-start").checked,
+        api_key: publicMode ? publicKeyInput.value : undefined
       });
+      if (publicMode) publicKeyInput.value = "";
       await refresh();
     } catch (error) {
       message.textContent = error.message;
@@ -212,6 +241,8 @@ PAGE = r"""<!doctype html>
     try {
       const response = await fetch("/api/status", {cache: "no-store"});
       const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not load session status.");
+      publicMode = Boolean(data.public_mode);
       const state = data.state || "idle";
       const active = activeStates.has(state);
       stateLabel.textContent = labels[state] || state;
@@ -220,7 +251,10 @@ PAGE = r"""<!doctype html>
       progress.textContent = data.question
         ? `Question ${data.question}${data.total ? ` of ${data.total}` : ""}`
         : "";
-      startButton.disabled = active || data.worker_alive || !data.api_key_configured;
+      startButton.disabled = active || data.worker_alive
+        || (data.public_mode
+          ? !publicKeyInput.value.trim()
+          : !data.api_key_configured);
       stopButton.disabled = !active;
       closeButton.disabled = !data.close_available;
       if (data.logs.length !== lastLogCount) {
@@ -239,16 +273,32 @@ PAGE = r"""<!doctype html>
       }
       if (data.public_mode) {
         keyForm.closest(".card").style.display = "none";
+        publicKeyRow.style.display = "block";
+        publicKeyInput.required = true;
+        browserViewCard.style.display = data.live_view_url ? "block" : "none";
+        if (data.live_view_url && browserView.src !== data.live_view_url) {
+          browserView.src = data.live_view_url;
+          openBrowserView.href = data.live_view_url;
+        } else if (!data.live_view_url && browserView.src) {
+          browserView.src = "about:blank";
+          openBrowserView.href = "#";
+        }
+        document.querySelector("#intro").textContent =
+          "Use the hosted browser below. Sign-in is kept in an isolated Browserbase cloud context linked to this browser.";
+        document.querySelector("#browser-hint").textContent =
+          "Your sign-in is stored in this visitor’s Browserbase context, not on this device or shared with other visitors.";
+        document.querySelector("#run-notice").textContent =
+          "It stops before final submission. Review and submit manually in the browser view. Starting an assignment may use an attempt; confirm you’re allowed to automate it.";
       }
-      if (!keyStatusEdited) {
+      if (!keyStatusEdited && !data.public_mode) {
         keyStatus.textContent = data.api_key_configured
-          ? (data.public_mode
-            ? "The hosted Groq key is configured."
-            : "A key is saved on this computer. Paste another one above to replace it.")
+          ? "A key is saved on this computer. Paste another one above to replace it."
           : "Add it once here; you won’t need to re-enter it each time.";
       }
-    } catch (_) {
-      message.textContent = "Could not reach the local app. Check that web_app.py is still running.";
+    } catch (error) {
+      message.textContent = error.message || (publicMode
+        ? "Could not load your hosted browser session. Refresh and try again."
+        : "Could not reach the local app. Check that web_app.py is still running.");
     }
   }
 
@@ -298,6 +348,7 @@ class RunController:
             "message": "Ready when you are.",
             "question": None,
             "total": None,
+            "live_view_url": None,
         }
 
     def report(self, event):
@@ -309,18 +360,26 @@ class RunController:
                 self.state["question"] = event["question"]
             if event.get("total") is not None:
                 self.state["total"] = event["total"]
+            if "live_view_url" in event:
+                self.state["live_view_url"] = event["live_view_url"]
             self.logs.append({
                 "time": datetime.now().strftime("%H:%M:%S"),
                 "message": message,
             })
 
-    def start(self, url, auto_start):
+    def start(self, url, auto_start, api_key=None, browser_context_id=None):
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("Enter a full http:// or https:// assignment URL.")
-        load_env_file()
-        if not os.environ.get("GROQ_API_KEY", "").strip():
-            raise ValueError("GROQ_API_KEY is missing from .env.")
+        if PUBLIC_MODE:
+            if not isinstance(api_key, str) or not api_key.strip():
+                raise ValueError("Paste your Groq API key to start.")
+            if not browser_context_id:
+                raise ValueError("The visitor browser context is missing. Refresh the page.")
+        else:
+            load_env_file()
+            if not os.environ.get("GROQ_API_KEY", "").strip():
+                raise ValueError("GROQ_API_KEY is missing from .env.")
         with self.lock:
             if self.worker and self.worker.is_alive():
                 raise ValueError("A run is already active.")
@@ -328,9 +387,10 @@ class RunController:
             self.close_event = threading.Event()
             self.state = {
                 "state": "starting",
-                "message": "Starting the local browser runner.",
+                "message": "Starting the browser runner.",
                 "question": None,
                 "total": None,
+                "live_view_url": None,
             }
             self.logs.clear()
             self.logs.append({
@@ -339,13 +399,13 @@ class RunController:
             })
             self.worker = threading.Thread(
                 target=self._run,
-                args=(url, auto_start, self.stop_event),
+                args=(url, auto_start, self.stop_event, api_key, browser_context_id),
                 name="quiz-runner",
                 daemon=True,
             )
             self.worker.start()
 
-    def _run(self, url, auto_start, stop_event):
+    def _run(self, url, auto_start, stop_event, api_key, browser_context_id):
         try:
             result = run_automation(
                 url,
@@ -353,16 +413,23 @@ class RunController:
                 stop_event=stop_event,
                 close_event=self.close_event,
                 auto_start=auto_start,
-                keep_browser_open=not PUBLIC_MODE,
+                keep_browser_open=True,
+                api_key=api_key,
+                browser_context_id=browser_context_id,
             )
             self.report({
                 "status": result,
                 "message": f"Browser closed. Run ended: {result.replace('_', ' ')}.",
+                "live_view_url": "",
             })
         except Exception as exc:
             snapshot = self.snapshot()
             if snapshot["state"] != "failed":
-                self.report({"status": "failed", "message": str(exc)})
+                self.report({
+                    "status": "failed",
+                    "message": str(exc),
+                    "live_view_url": "",
+                })
 
     def stop(self):
         with self.lock:
@@ -400,29 +467,154 @@ class RunController:
             return {
                 **self.state,
                 "logs": list(self.logs),
-                "api_key_configured": bool(os.environ.get("GROQ_API_KEY", "").strip()),
+                "api_key_configured": (
+                    True if PUBLIC_MODE
+                    else bool(os.environ.get("GROQ_API_KEY", "").strip())
+                ),
                 "worker_alive": worker_alive,
                 "close_available": worker_alive and self.state["state"] == "awaiting_close",
                 "public_mode": PUBLIC_MODE,
             }
 
 
+def encode_session_cookie(visitor_id, browser_context_id=None):
+    secret = os.getenv("APP_SECRET", "")
+    if len(secret) < 32:
+        raise RuntimeError("Set APP_SECRET to a random value of at least 32 characters.")
+    payload = json.dumps(
+        {"visitor_id": visitor_id, "browser_context_id": browser_context_id},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    signature = hmac.new(secret.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def decode_session_cookie(token):
+    secret = os.getenv("APP_SECRET", "")
+    if len(secret) < 32 or not token or "." not in token:
+        return None
+    encoded, signature = token.rsplit(".", 1)
+    expected = hmac.new(secret.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return None
+    try:
+        payload = encoded.encode("ascii")
+        payload += b"=" * (-len(payload) % 4)
+        identity = json.loads(base64.urlsafe_b64decode(payload))
+    except (ValueError, UnicodeError, json.JSONDecodeError):
+        return None
+    visitor_id = identity.get("visitor_id") if isinstance(identity, dict) else None
+    browser_context_id = identity.get("browser_context_id") if isinstance(identity, dict) else None
+    if not isinstance(visitor_id, str) or not visitor_id:
+        return None
+    if browser_context_id is not None and not isinstance(browser_context_id, str):
+        return None
+    return {"visitor_id": visitor_id, "browser_context_id": browser_context_id}
+
+
+class ControllerRegistry:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.controllers = {}
+        self.active_visitor_id = None
+
+    def get(self, visitor_id):
+        with self.lock:
+            if visitor_id not in self.controllers:
+                self.controllers[visitor_id] = RunController()
+            return self.controllers[visitor_id]
+
+    def snapshot(self, visitor_id):
+        with self.lock:
+            controller = self.controllers.get(visitor_id)
+        return controller.snapshot() if controller else RunController().snapshot()
+
+    def start(self, visitor_id, url, auto_start, api_key, browser_context_id):
+        with self.lock:
+            if self.active_visitor_id:
+                active_controller = self.controllers.get(self.active_visitor_id)
+                if active_controller and active_controller.snapshot()["worker_alive"]:
+                    if self.active_visitor_id != visitor_id:
+                        raise ValueError("Another visitor is using the browser right now. Please try again later.")
+                else:
+                    self.active_visitor_id = None
+
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("Enter a full http:// or https:// assignment URL.")
+            if not isinstance(api_key, str) or not api_key.strip():
+                raise ValueError("Paste your Groq API key to start.")
+            if not browser_context_id:
+                browser_context_id = create_browserbase_context()
+
+            controller = self.controllers.get(visitor_id)
+            if controller is None:
+                controller = RunController()
+                self.controllers[visitor_id] = controller
+            controller.start(
+                url,
+                auto_start,
+                api_key=api_key,
+                browser_context_id=browser_context_id,
+            )
+            self.active_visitor_id = visitor_id
+            return controller, browser_context_id
+
+
 CONTROLLER = RunController()
+CONTROLLERS = ControllerRegistry()
 
 
 class RequestHandler(BaseHTTPRequestHandler):
-    def _send_json(self, status, data):
+    def _send_json(self, status, data, session_cookie=None):
         payload = json.dumps(data).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        if session_cookie:
+            secure = "; Secure" if PUBLIC_MODE else ""
+            self.send_header(
+                "Set-Cookie",
+                f"{SESSION_COOKIE}={session_cookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000{secure}",
+            )
         self.end_headers()
         self.wfile.write(payload)
 
+    def _get_identity(self, create=False):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+        except CookieError:
+            pass
+        morsel = cookie.get(SESSION_COOKIE)
+        token = morsel.value if morsel else ""
+        identity = decode_session_cookie(token)
+        if identity:
+            return identity, None
+        if not create:
+            return None, None
+        visitor_id = secrets.token_urlsafe(24)
+        identity = {"visitor_id": visitor_id, "browser_context_id": None}
+        return identity, encode_session_cookie(visitor_id)
+
     def do_GET(self):
         if self.path == "/api/status":
-            self._send_json(200, CONTROLLER.snapshot())
+            if PUBLIC_MODE:
+                try:
+                    identity, new_cookie = self._get_identity(create=True)
+                    status = CONTROLLERS.snapshot(identity["visitor_id"])
+                except RuntimeError as exc:
+                    self._send_json(503, {"error": str(exc)})
+                    return
+                self._send_json(
+                    200,
+                    status,
+                    session_cookie=new_cookie,
+                )
+            else:
+                self._send_json(200, CONTROLLER.snapshot())
             return
         if self.path == "/":
             payload = PAGE.encode("utf-8")
@@ -444,11 +636,33 @@ class RequestHandler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("Invalid request body.")
             if self.path == "/api/start":
-                CONTROLLER.start(
-                    str(payload.get("url", "")).strip(),
-                    bool(payload.get("auto_start", False)),
-                )
-                self._send_json(202, {"ok": True})
+                if PUBLIC_MODE:
+                    api_key = payload.get("api_key")
+                    if not isinstance(api_key, str) or not api_key.strip():
+                        raise ValueError("Paste your Groq API key to start.")
+                    identity, _ = self._get_identity(create=True)
+                    controller, browser_context_id = CONTROLLERS.start(
+                        identity["visitor_id"],
+                        str(payload.get("url", "")).strip(),
+                        bool(payload.get("auto_start", False)),
+                        api_key.strip(),
+                        identity["browser_context_id"],
+                    )
+                    session_cookie = encode_session_cookie(
+                        identity["visitor_id"],
+                        browser_context_id,
+                    )
+                    self._send_json(
+                        202,
+                        {"ok": True, "state": controller.snapshot()["state"]},
+                        session_cookie=session_cookie,
+                    )
+                else:
+                    CONTROLLER.start(
+                        str(payload.get("url", "")).strip(),
+                        bool(payload.get("auto_start", False)),
+                    )
+                    self._send_json(202, {"ok": True})
             elif self.path == "/api/config":
                 if PUBLIC_MODE:
                     self._send_json(
@@ -469,21 +683,38 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(200, {"ok": True})
             elif self.path == "/api/stop":
-                CONTROLLER.stop()
+                controller = self._get_request_controller()
+                controller.stop()
                 self._send_json(202, {"ok": True})
             elif self.path == "/api/close":
-                CONTROLLER.close_browser()
+                controller = self._get_request_controller()
+                controller.close_browser()
                 self._send_json(202, {"ok": True})
             else:
                 self._send_json(404, {"error": "Not found."})
         except (ValueError, json.JSONDecodeError) as exc:
             self._send_json(400, {"error": str(exc)})
+        except RuntimeError as exc:
+            self._send_json(502, {"error": str(exc)})
+
+    def _get_request_controller(self):
+        if not PUBLIC_MODE:
+            return CONTROLLER
+        identity, _ = self._get_identity()
+        if identity is None:
+            raise ValueError("Session expired. Reload the page and try again.")
+        return CONTROLLERS.get(identity["visitor_id"])
 
     def log_message(self, format_string, *args):
         return
 
 
 def main():
+    if PUBLIC_MODE:
+        if len(os.getenv("APP_SECRET", "")) < 32:
+            raise RuntimeError("Set APP_SECRET to a random value of at least 32 characters.")
+        if not os.getenv("BROWSERBASE_API_KEY", "").strip():
+            raise RuntimeError("Set BROWSERBASE_API_KEY in the hosted service environment.")
     load_env_file()
     server = ThreadingHTTPServer((HOST, PORT), RequestHandler)
     server.daemon_threads = True
