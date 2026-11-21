@@ -41,6 +41,10 @@ When `SUPABASE_DATABASE_URL` is set, accounts, DOB, salted password hashes, sess
 
 Switching an existing installation from SQLite to Supabase does not copy its existing accounts or keys automatically. Back up the SQLite database and arrange a one-time migration before switching if it already contains data.
 
+## Assignment credits
+
+In **Admin → Users**, configure the default assignment credits and expiry for new accounts. Defaults apply only to accounts created after the change; existing accounts are not modified. You can also allocate credits to an individual account, choosing an expiry in days or `0` for no expiry. Expired credits are not available to users. A credit is reserved when a user starts a run, consumed only when the assistant reaches the review-ready stage, and returned to its original grant if the run fails or is stopped early. A reservation does not expire mid-run, but a refund remains subject to that grant's expiry. Cashfree payment verification is not integrated yet; do not treat uploaded screenshots as proof of payment.
+
 ## Mobile OTP sign-in on study sites
 
 For Sunstone URLs, the dashboard offers an optional phone-number field. The number is used only to fill and submit the phone field on `hub.sunstone.in` or `www.hub.sunstone.in`; it is not saved in the account or database. The user enters the OTP directly in the browser view on their phone (or opens the view in a separate tab). The per-account hosted browser context is retained so Sunstone can stay signed in across later app logins. Do not send OTPs to the app or automate reading SMS messages.

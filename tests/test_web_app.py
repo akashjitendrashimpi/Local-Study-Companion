@@ -144,7 +144,8 @@ class WebAppTests(unittest.TestCase):
                     username TEXT NOT NULL COLLATE NOCASE UNIQUE,
                     date_of_birth TEXT NOT NULL,
                     password_hash TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    assignment_credits INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE sessions (
                     token_hash TEXT PRIMARY KEY,
@@ -159,7 +160,9 @@ class WebAppTests(unittest.TestCase):
                     encrypted_key TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
-                INSERT INTO users VALUES (1, 'legacy_user', '2000-01-02', 'hash', '2025-01-01');
+                INSERT INTO users (
+                    id, username, date_of_birth, password_hash, created_at, assignment_credits
+                ) VALUES (1, 'legacy_user', '2000-01-02', 'hash', '2025-01-01', 4);
                 INSERT INTO sessions VALUES (
                     'existing-token-hash', 'legacy_user', 'user',
                     'legacy-visitor', 'persistent-browser-context', '2025-01-02'
@@ -172,12 +175,29 @@ class WebAppTests(unittest.TestCase):
                 first_token = _create_session("legacy_user", "user")
                 first_session = _load_session(first_token)
                 second_session = _load_session(_create_session("legacy_user", "user"))
+                with _connect_database() as migrated_connection:
+                    migrated_user = _execute(
+                        migrated_connection,
+                        "SELECT assignment_credits FROM users WHERE username = ?",
+                        ("legacy_user",),
+                    ).fetchone()
+                    migrated_grant = _execute(
+                        migrated_connection,
+                        """
+                        SELECT granted_credits, remaining_credits, expires_at
+                        FROM assignment_credit_grants WHERE user_id = 1
+                        """,
+                    ).fetchone()
 
             self.assertEqual(
                 first_session["browser_context_id"],
                 "persistent-browser-context",
             )
             self.assertEqual(first_session["visitor_id"], second_session["visitor_id"])
+            self.assertEqual(migrated_user["assignment_credits"], 4)
+            self.assertEqual(migrated_grant["granted_credits"], 4)
+            self.assertEqual(migrated_grant["remaining_credits"], 4)
+            self.assertIsNone(migrated_grant["expires_at"])
 
     def test_account_creation_login_and_logout_keep_session_private(self):
         cookie = self.signup()
@@ -302,6 +322,208 @@ class WebAppTests(unittest.TestCase):
             )[0],
             200,
         )
+
+    def test_admin_can_allocate_non_expiring_assignment_credits(self):
+        user_cookie = self.signup("credits_user")
+        admin_cookie = self.login_admin()
+        with patch("web_app._get_api_keys", return_value=["test-key"]):
+            status, _, body = self.request(
+                "/api/start",
+                "POST",
+                {"url": "https://example.test/assignment"},
+                user_cookie,
+            )
+        self.assertEqual(status, 400)
+        self.assertIn("No assignments remaining", body["error"])
+        self.assertEqual(
+            self.request("/api/admin/users", cookie=admin_cookie)[2]["users"][0][
+                "assignment_credits"
+            ],
+            0,
+        )
+        self.assertEqual(
+            self.request(
+                "/api/admin/users/credits",
+                "POST",
+                {"username": "credits_user", "amount": 3},
+                user_cookie,
+            )[0],
+            403,
+        )
+        for amount in (0, -1, 10001, 1.5, True):
+            status, _, body = self.request(
+                "/api/admin/users/credits",
+                "POST",
+                {"username": "credits_user", "amount": amount},
+                admin_cookie,
+            )
+            self.assertEqual(status, 400)
+            self.assertIn("error", body)
+
+        status, _, result = self.request(
+            "/api/admin/users/credits",
+            "POST",
+            {"username": "credits_user", "amount": 3},
+            admin_cookie,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(result["assignment_credits"], 3)
+        self.assertEqual(
+            self.request("/api/admin/users", cookie=admin_cookie)[2]["users"][0][
+                "assignment_credits"
+            ],
+            3,
+        )
+        with patch("web_app._get_api_keys", return_value=["test-key"]):
+            with patch("web_app.CONTROLLERS.start", side_effect=ValueError("start failed")):
+                status, _, _ = self.request(
+                    "/api/start",
+                    "POST",
+                    {"url": "https://example.test/assignment"},
+                    user_cookie,
+                )
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            self.request("/api/status", cookie=user_cookie)[2]["assignment_credits"],
+            3,
+        )
+        status, _, status_data = self.request("/api/status", cookie=user_cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(status_data["assignment_credits"], 3)
+
+    def test_assignment_credit_defaults_apply_only_to_future_accounts(self):
+        admin_cookie = self.login_admin()
+        user_cookie = self.signup("existing_default")
+        self.assertEqual(
+            self.request(
+                "/api/admin/credits/defaults",
+                "POST",
+                {"credits": 2, "expiry_days": 30},
+                admin_cookie,
+            )[0],
+            200,
+        )
+        self.assertEqual(
+            self.request(
+                "/api/admin/credits/defaults",
+                "GET",
+                cookie=admin_cookie,
+            )[2],
+            {"credits": 2, "expiry_days": 30},
+        )
+        self.assertEqual(
+            self.request("/api/status", cookie=user_cookie)[2]["assignment_credits"],
+            0,
+        )
+
+        future_cookie = self.signup("future_default")
+        self.assertEqual(
+            self.request("/api/status", cookie=future_cookie)[2]["assignment_credits"],
+            2,
+        )
+        self.assertEqual(
+            self.request(
+                "/api/admin/credits/defaults",
+                "POST",
+                {"credits": 5, "expiry_days": 0},
+                admin_cookie,
+            )[0],
+            200,
+        )
+        self.assertEqual(
+            self.request("/api/status", cookie=future_cookie)[2]["assignment_credits"],
+            2,
+        )
+        self.assertEqual(
+            self.request("/api/status", cookie=self.signup("latest_default"))[2][
+                "assignment_credits"
+            ],
+            5,
+        )
+
+    def test_expired_credit_grants_are_ignored_and_unlimited_grants_work(self):
+        admin_cookie = self.login_admin()
+        user_cookie = self.signup("expiry_user")
+        for expiry_days in (-1, 3651, True):
+            status, _, body = self.request(
+                "/api/admin/users/credits",
+                "POST",
+                {"username": "expiry_user", "amount": 1, "expiry_days": expiry_days},
+                admin_cookie,
+            )
+            self.assertEqual(status, 400)
+            self.assertIn("error", body)
+
+        status, _, _ = self.request(
+            "/api/admin/users/credits",
+            "POST",
+            {"username": "expiry_user", "amount": 2, "expiry_days": 1},
+            admin_cookie,
+        )
+        self.assertEqual(status, 200)
+        with _connect_database() as connection:
+            _execute(
+                connection,
+                "UPDATE assignment_credit_grants SET expires_at = ? WHERE user_id = (SELECT id FROM users WHERE username = ?)",
+                (int(time.time()) - 1, "expiry_user"),
+            )
+            connection.commit()
+
+        self.assertEqual(
+            self.request("/api/status", cookie=user_cookie)[2]["assignment_credits"],
+            0,
+        )
+        with patch("web_app._get_api_keys", return_value=["test-key"]):
+            status, _, body = self.request(
+                "/api/start",
+                "POST",
+                {"url": "https://example.test/assignment"},
+                user_cookie,
+            )
+        self.assertEqual(status, 400)
+        self.assertIn("No assignments remaining", body["error"])
+
+        status, _, result = self.request(
+            "/api/admin/users/credits",
+            "POST",
+            {"username": "expiry_user", "amount": 1, "expiry_days": 0},
+            admin_cookie,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(result["assignment_credits"], 1)
+
+    def test_assignment_credit_is_consumed_only_when_run_reaches_review(self):
+        admin_cookie = self.login_admin()
+
+        for username, result, expected_credits in (
+            ("failed_credit_user", "failed", 1),
+            ("completed_credit_user", "awaiting_submission", 0),
+        ):
+            cookie = self.signup(username)
+            allocation_status, _, _ = self.request(
+                "/api/admin/users/credits",
+                "POST",
+                {"username": username, "amount": 1},
+                admin_cookie,
+            )
+            self.assertEqual(allocation_status, 200)
+            session = _load_session(cookie.partition("=")[2])
+
+            with patch("web_app._get_api_keys", return_value=["test-key"]):
+                with patch("web_app.run_automation", return_value=result):
+                    start_status, _, _ = self.request(
+                        "/api/start",
+                        "POST",
+                        {"url": "https://example.test/assignment"},
+                        cookie,
+                    )
+                    self.assertEqual(start_status, 202)
+                    controller = CONTROLLERS.get(session["visitor_id"])
+                    controller.worker.join(timeout=2)
+
+            status, _, data = self.request("/api/status", cookie=cookie)
+            self.assertEqual(status, 200)
+            self.assertEqual(data["assignment_credits"], expected_credits)
 
     def test_account_pages_and_status_require_login_and_no_key_prompt_is_shown(self):
         status, _, page = self.request("/")

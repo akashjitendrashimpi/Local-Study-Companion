@@ -101,7 +101,8 @@ def _initialize_database(connection, is_postgres):
                         password_hash TEXT NOT NULL,
                         created_at TEXT NOT NULL,
                         visitor_id TEXT,
-                        browser_context_id TEXT
+                        browser_context_id TEXT,
+                        assignment_credits INTEGER NOT NULL DEFAULT 0
                     )
                     """,
                     """
@@ -121,12 +122,31 @@ def _initialize_database(connection, is_postgres):
                         created_at TEXT NOT NULL
                     )
                     """,
+                    """
+                    CREATE TABLE IF NOT EXISTS app_settings (
+                        setting_key TEXT PRIMARY KEY,
+                        setting_value TEXT NOT NULL
+                    )
+                    """,
+                    """
+                    CREATE TABLE IF NOT EXISTS assignment_credit_grants (
+                        id BIGSERIAL PRIMARY KEY,
+                        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        granted_credits INTEGER NOT NULL,
+                        remaining_credits INTEGER NOT NULL,
+                        created_at TEXT NOT NULL,
+                        expires_at BIGINT
+                    )
+                    """,
                 )
                 for statement in statements:
                     connection.execute(statement)
                 connection.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS visitor_id TEXT")
                 connection.execute(
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS browser_context_id TEXT"
+                )
+                connection.execute(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS assignment_credits INTEGER NOT NULL DEFAULT 0"
                 )
                 connection.execute(
                     "ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_visitor_id_key"
@@ -141,7 +161,8 @@ def _initialize_database(connection, is_postgres):
                     password_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     visitor_id TEXT,
-                    browser_context_id TEXT
+                    browser_context_id TEXT,
+                    assignment_credits INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS sessions (
                     token_hash TEXT PRIMARY KEY,
@@ -156,6 +177,18 @@ def _initialize_database(connection, is_postgres):
                     encrypted_key TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    setting_key TEXT PRIMARY KEY,
+                    setting_value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS assignment_credit_grants (
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    granted_credits INTEGER NOT NULL,
+                    remaining_credits INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at INTEGER
+                );
                 """
                 )
                 columns = {
@@ -166,6 +199,10 @@ def _initialize_database(connection, is_postgres):
                 if "browser_context_id" not in columns:
                     connection.execute(
                         "ALTER TABLE users ADD COLUMN browser_context_id TEXT"
+                    )
+                if "assignment_credits" not in columns:
+                    connection.execute(
+                        "ALTER TABLE users ADD COLUMN assignment_credits INTEGER NOT NULL DEFAULT 0"
                     )
 
                 unique_visitor_index = False
@@ -208,6 +245,49 @@ def _initialize_database(connection, is_postgres):
                         "ALTER TABLE sessions_rebuild RENAME TO sessions"
                     )
 
+            _execute(
+                connection,
+                "CREATE INDEX IF NOT EXISTS assignment_credit_grants_user_expiry_idx ON assignment_credit_grants (user_id, expires_at, id)",
+            )
+            for setting_key in (
+                "default_assignment_credits",
+                "default_assignment_expiry_days",
+            ):
+                _execute(
+                    connection,
+                    """
+                    INSERT INTO app_settings (setting_key, setting_value)
+                    VALUES (?, '0') ON CONFLICT(setting_key) DO NOTHING
+                    """,
+                    (setting_key,),
+                )
+            legacy_credit_users = _execute(
+                connection,
+                """
+                SELECT u.id, u.assignment_credits FROM users u
+                WHERE u.assignment_credits > 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM assignment_credit_grants g
+                      WHERE g.user_id = u.id
+                  )
+                """,
+            ).fetchall()
+            for user in legacy_credit_users:
+                _execute(
+                    connection,
+                    """
+                    INSERT INTO assignment_credit_grants (
+                        user_id, granted_credits, remaining_credits, created_at, expires_at
+                    ) VALUES (?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        user["id"],
+                        user["assignment_credits"],
+                        user["assignment_credits"],
+                        datetime.now().isoformat(),
+                    ),
+                )
+
             existing_users = connection.execute(
                 "SELECT username, visitor_id, browser_context_id FROM users"
             ).fetchall()
@@ -239,22 +319,25 @@ def _initialize_database(connection, is_postgres):
                 connection.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS users_visitor_id_unique ON users (visitor_id)"
                 )
+                connection.execute("ALTER TABLE app_settings ENABLE ROW LEVEL SECURITY")
+                connection.execute(
+                    "ALTER TABLE assignment_credit_grants ENABLE ROW LEVEL SECURITY"
+                )
                 connection.execute("ALTER TABLE users ENABLE ROW LEVEL SECURITY")
                 connection.execute("ALTER TABLE sessions ENABLE ROW LEVEL SECURITY")
                 connection.execute("ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY")
                 connection.execute(
-                    "REVOKE ALL ON TABLE users, sessions, api_keys FROM anon, authenticated"
+                    "REVOKE ALL ON TABLE users, sessions, api_keys, app_settings, assignment_credit_grants FROM anon, authenticated"
                 )
                 connection.execute(
-                    "REVOKE ALL ON SEQUENCE users_id_seq, api_keys_id_seq FROM anon, authenticated"
+                    "REVOKE ALL ON SEQUENCE users_id_seq, api_keys_id_seq, assignment_credit_grants_id_seq FROM anon, authenticated"
                 )
             else:
                 connection.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS users_visitor_id_unique ON users (visitor_id)"
                 )
                 connection.commit()
-            if is_postgres:
-                connection.commit()
+            connection.commit()
             INITIALIZED_DATABASES.add(database_identity)
 
 
@@ -281,6 +364,165 @@ def _execute(connection, statement, parameters=()):
     if SUPABASE_DATABASE_URL:
         statement = statement.replace("?", "%s")
     return connection.execute(statement, parameters)
+
+
+def _get_app_setting(connection, setting_key):
+    row = _execute(
+        connection,
+        "SELECT setting_value FROM app_settings WHERE setting_key = ?",
+        (setting_key,),
+    ).fetchone()
+    return row["setting_value"] if row else "0"
+
+
+def _set_app_setting(connection, setting_key, setting_value):
+    _execute(
+        connection,
+        """
+        INSERT INTO app_settings (setting_key, setting_value)
+        VALUES (?, ?)
+        ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value
+        """,
+        (setting_key, str(setting_value)),
+    )
+
+
+def _get_default_assignment_settings(connection):
+    return {
+        "credits": int(_get_app_setting(connection, "default_assignment_credits")),
+        "expiry_days": int(
+            _get_app_setting(connection, "default_assignment_expiry_days")
+        ),
+    }
+
+
+def _available_assignment_credits(connection, user_id):
+    now = int(datetime.now().timestamp())
+    row = _execute(
+        connection,
+        """
+        SELECT COALESCE(SUM(remaining_credits), 0) AS credits
+        FROM assignment_credit_grants
+        WHERE user_id = ? AND remaining_credits > 0
+          AND (expires_at IS NULL OR expires_at > ?)
+        """,
+        (user_id, now),
+    ).fetchone()
+    credits = int(row["credits"] or 0)
+    _execute(
+        connection,
+        "UPDATE users SET assignment_credits = ? WHERE id = ?",
+        (credits, user_id),
+    )
+    return credits
+
+
+def _insert_assignment_credit_grant(connection, user_id, amount, expiry_days):
+    now = int(datetime.now().timestamp())
+    expires_at = now + expiry_days * 86400 if expiry_days else None
+    _execute(
+        connection,
+        """
+        INSERT INTO assignment_credit_grants (
+            user_id, granted_credits, remaining_credits, created_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (user_id, amount, amount, datetime.now().isoformat(), expires_at),
+    )
+    return _available_assignment_credits(connection, user_id)
+
+
+def _add_assignment_credits(username, amount, expiry_days=None):
+    if isinstance(amount, bool) or not isinstance(amount, int) or not 1 <= amount <= 10000:
+        raise ValueError("Enter a whole number of assignments from 1 to 10,000.")
+    if expiry_days is None:
+        with _connect_database() as connection:
+            expiry_days = _get_default_assignment_settings(connection)["expiry_days"]
+    if (
+        isinstance(expiry_days, bool)
+        or not isinstance(expiry_days, int)
+        or not 0 <= expiry_days <= 3650
+    ):
+        raise ValueError("Enter an expiry from 0 to 3,650 days; use 0 for no expiry.")
+    with _connect_database() as connection:
+        user = _execute(
+            connection,
+            "SELECT id FROM users WHERE LOWER(username) = LOWER(?)",
+            (username,),
+        ).fetchone()
+        if not user:
+            raise ValueError("User account not found.")
+        balance = _insert_assignment_credit_grant(
+            connection, user["id"], amount, expiry_days
+        )
+        connection.commit()
+        return balance
+
+
+def _reserve_assignment_credit(username):
+    with _connect_database() as connection:
+        user = _execute(
+            connection,
+            "SELECT id FROM users WHERE LOWER(username) = LOWER(?)",
+            (username,),
+        ).fetchone()
+        if not user:
+            raise ValueError("User account not found.")
+        now = int(datetime.now().timestamp())
+        statement = """
+            SELECT id FROM assignment_credit_grants
+            WHERE user_id = ? AND remaining_credits > 0
+              AND (expires_at IS NULL OR expires_at > ?)
+            ORDER BY CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END,
+                     expires_at, id
+            LIMIT 1
+        """
+        if SUPABASE_DATABASE_URL:
+            statement += " FOR UPDATE"
+        grant = _execute(connection, statement, (user["id"], now)).fetchone()
+        if not grant:
+            _available_assignment_credits(connection, user["id"])
+            connection.commit()
+            raise ValueError("No assignments remaining. Contact the administrator for more credits.")
+        cursor = _execute(
+            connection,
+            """
+            UPDATE assignment_credit_grants
+            SET remaining_credits = remaining_credits - 1
+            WHERE id = ? AND user_id = ? AND remaining_credits > 0
+              AND (expires_at IS NULL OR expires_at > ?)
+            """,
+            (grant["id"], user["id"], now),
+        )
+        if not cursor.rowcount:
+            raise ValueError("No assignments remaining. Contact the administrator for more credits.")
+        _available_assignment_credits(connection, user["id"])
+        connection.commit()
+        return grant["id"]
+
+
+def _refund_assignment_credit(username, grant_id):
+    with _connect_database() as connection:
+        user = _execute(
+            connection,
+            "SELECT id FROM users WHERE LOWER(username) = LOWER(?)",
+            (username,),
+        ).fetchone()
+        if not user:
+            raise RuntimeError("The assignment credit could not be restored; contact the administrator.")
+        cursor = _execute(
+            connection,
+            """
+            UPDATE assignment_credit_grants
+            SET remaining_credits = remaining_credits + 1
+            WHERE id = ? AND user_id = ?
+            """,
+            (grant_id, user["id"]),
+        )
+        if not cursor.rowcount:
+            raise RuntimeError("The assignment credit could not be restored; contact the administrator.")
+        _available_assignment_credits(connection, user["id"])
+        connection.commit()
 
 
 def _password_hash(password, salt=None):
@@ -457,27 +699,52 @@ textarea{min-height:110px;resize:vertical}.search-row{display:flex;align-items:c
 .user-card,#keys li{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;padding:16px;border:1px solid #e8ecf3;border-radius:13px}
 .user-name{font-weight:750;font-size:1.03rem}.user-meta{flex-wrap:wrap;margin-top:5px;color:#758096;font-size:.87rem}
 .reset-form{align-items:flex-end;min-width:min(360px,100%)}.reset-form label{flex:1;min-width:160px;margin:0}
+.credit-form{display:flex;align-items:flex-end;gap:8px;margin-top:10px;max-width:480px}.credit-form label{flex:1;min-width:100px;margin:0}.credit-form input{margin-top:5px}.credit-form button{white-space:nowrap}
+.default-credit-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;max-width:560px;margin-top:14px}.default-credit-form label{margin:0}.default-credit-form input{margin-top:5px}.default-credit-form button,.default-credit-form .feedback{grid-column:1/-1}
 .hint{margin:8px 0 0;line-height:1.45}.feedback,#feedback{min-height:1.4em;color:#46536a;margin:12px 0 0}
 .panel[hidden]{display:none!important}button:disabled{opacity:.55;cursor:not-allowed}
-@media(max-width:620px){body{padding:14px}header{align-items:flex-start;flex-direction:column}.header-actions{width:100%;justify-content:space-between}.card{padding:17px;border-radius:15px}.tabs{width:100%}.tab{flex:1}.search-row{align-items:stretch;flex-direction:column}.search-row input{max-width:none}.user-card,#keys li{flex-direction:column;gap:14px}.reset-form{width:100%;align-items:stretch;flex-direction:column}.reset-form label{width:100%}.reset-form button{width:100%}}
+@media(max-width:620px){body{padding:14px}header{align-items:flex-start;flex-direction:column}.header-actions{width:100%;justify-content:space-between}.card{padding:17px;border-radius:15px}.tabs{width:100%}.tab{flex:1}.search-row{align-items:stretch;flex-direction:column}.search-row input{max-width:none}.user-card,#keys li{flex-direction:column;gap:14px}.reset-form{width:100%;align-items:stretch;flex-direction:column}.reset-form label{width:100%}.reset-form button{width:100%}.credit-form{width:100%;max-width:none;align-items:stretch;flex-wrap:wrap}.credit-form label{min-width:0}.default-credit-form{grid-template-columns:1fr}}
 </style></head><body><main><header><div><h1>Admin dashboard</h1><div class="subtitle">Manage member profiles and shared model access.</div></div><div class="header-actions"><a class="button secondary" href="/">Back to app</a><button id="logout" class="secondary" type="button">Log out</button></div></header>
 <nav class="tabs" aria-label="Admin sections"><button class="tab" data-panel="users-panel" aria-selected="true" type="button">Users</button><button class="tab" data-panel="keys-panel" aria-selected="false" type="button">API keys</button></nav>
-<section id="users-panel" class="panel card"><div><h2>Accounts</h2><p class="hint">Usernames, dates of birth, and account creation dates. Passwords are never viewable; resets replace the password with a new one and sign out existing sessions.</p><p id="user-feedback" class="feedback" role="status" aria-live="polite"></p></div>
+<section id="users-panel" class="panel card"><div><h2>Accounts</h2><p class="hint">Manage new-account defaults and individual assignment credits. Failed runs return their reserved credit.</p><p id="user-feedback" class="feedback" role="status" aria-live="polite"></p>
+<form id="default-credit-form" class="default-credit-form"><label for="default-credit-amount">Default assignments for new accounts<input id="default-credit-amount" type="number" min="0" max="10000" step="1" required></label><label for="default-credit-expiry">Default expiry in days<input id="default-credit-expiry" type="number" min="0" max="3650" step="1" required></label><p class="hint" style="grid-column:1/-1">Changing defaults affects only accounts created afterward. Set assignments or expiry to 0 for none or no expiry, respectively.</p><button class="primary" type="submit">Save new-account defaults</button><p id="defaults-feedback" class="feedback" role="status" aria-live="polite"></p></form></div>
 <div class="search-row"><input id="user-search" type="search" placeholder="Search usernames" aria-label="Search users"><span id="user-count" class="count">Loading users…</span></div><div id="users" class="user-list"></div></section>
 <section id="keys-panel" class="panel card" hidden><form id="key-form"><label for="api-keys">Add API keys</label><textarea id="api-keys" placeholder="Paste one Groq API key per line" autocomplete="off" spellcheck="false" required></textarea><p class="hint">Keys are encrypted at rest and never shown again.</p><button class="primary" id="save" type="submit">Add keys</button><p id="feedback" role="status" aria-live="polite"></p></form>
 <h2 style="margin-top:24px">Configured keys</h2><p class="hint">A failed key is skipped during the current run.</p><ul id="keys"></ul></section></main>
 <script>
-const feedback=document.querySelector("#feedback"),userFeedback=document.querySelector("#user-feedback"),usersList=document.querySelector("#users"),userSearch=document.querySelector("#user-search"),userCount=document.querySelector("#user-count");
+const feedback=document.querySelector("#feedback"),userFeedback=document.querySelector("#user-feedback"),defaultsFeedback=document.querySelector("#defaults-feedback"),usersList=document.querySelector("#users"),userSearch=document.querySelector("#user-search"),userCount=document.querySelector("#user-count");
 async function request(path,options={}){const response=await fetch(path,{...options,headers:{"Content-Type":"application/json",...(options.headers||{})}});const data=await response.json();if(!response.ok)throw new Error(data.error||"Request failed.");return data}
 let users=[];
+let creditDefaults={credits:0,expiry_days:0};
 function formatBirthDate(value){const match=/^(\d{4})-(\d{2})-(\d{2})$/.exec(value);return match?`${match[2]}/${match[3]}/${match[1]}`:value}
-function renderUsers(){const query=userSearch.value.trim().toLowerCase(),visible=users.filter(user=>user.username.toLowerCase().includes(query));usersList.replaceChildren();userCount.textContent=`${visible.length} of ${users.length} accounts`;if(!visible.length){const empty=document.createElement("p");empty.className="hint";empty.textContent=users.length?"No usernames match your search.":"No accounts yet.";usersList.append(empty);return}for(const user of visible){const card=document.createElement("article"),profile=document.createElement("div"),name=document.createElement("div"),meta=document.createElement("div"),form=document.createElement("form"),label=document.createElement("label"),input=document.createElement("input"),button=document.createElement("button");card.className="user-card";profile.className="profile";name.className="user-name";name.textContent=user.username;meta.className="user-meta";meta.textContent=`Date of birth: ${formatBirthDate(user.date_of_birth)} · Joined: ${new Date(user.created_at).toLocaleDateString()}`;profile.append(name,meta);form.className="reset-form";label.textContent="Set new password";input.type="password";input.name="new_password";input.autocomplete="new-password";input.minLength=10;input.required=true;label.append(input);button.type="submit";button.className="secondary";button.textContent="Reset password";form.append(label,button);form.addEventListener("submit",async event=>{event.preventDefault();button.disabled=true;try{await request("/api/admin/users/reset-password",{method:"POST",body:JSON.stringify({username:user.username,new_password:input.value})});input.value="";userFeedback.textContent=`Password reset for ${user.username}; their existing sessions were revoked.`}catch(error){userFeedback.textContent=error.message}finally{button.disabled=false}});card.append(profile,form);usersList.append(card)}}
+function renderUsers(){
+  const query=userSearch.value.trim().toLowerCase(),visible=users.filter(user=>user.username.toLowerCase().includes(query));
+  usersList.replaceChildren();
+  userCount.textContent=`${visible.length} of ${users.length} accounts`;
+  if(!visible.length){const empty=document.createElement("p");empty.className="hint";empty.textContent=users.length?"No usernames match your search.":"No accounts yet.";usersList.append(empty);return}
+  for(const user of visible){
+    const card=document.createElement("article"),profile=document.createElement("div"),name=document.createElement("div"),meta=document.createElement("div"),credits=document.createElement("div"),creditForm=document.createElement("form"),creditLabel=document.createElement("label"),creditInput=document.createElement("input"),expiryLabel=document.createElement("label"),expiryInput=document.createElement("input"),creditButton=document.createElement("button"),resetForm=document.createElement("form"),resetLabel=document.createElement("label"),resetInput=document.createElement("input"),resetButton=document.createElement("button");
+    card.className="user-card";profile.className="profile";name.className="user-name";name.textContent=user.username;
+    meta.className="user-meta";meta.textContent=`Date of birth: ${formatBirthDate(user.date_of_birth)} · Joined: ${new Date(user.created_at).toLocaleDateString()}`;
+    credits.className="user-meta";credits.textContent=`Assignments available: ${user.assignment_credits}`;
+    creditForm.className="credit-form";creditLabel.textContent="Add assignments";creditInput.type="number";creditInput.name="amount";creditInput.min="1";creditInput.max="10000";creditInput.step="1";creditInput.required=true;creditInput.value=creditDefaults.credits||"";creditInput.setAttribute("aria-label",`Assignments to add for ${user.username}`);creditLabel.append(creditInput);
+    expiryLabel.textContent="Expiry (days; 0 = never)";expiryInput.type="number";expiryInput.name="expiry_days";expiryInput.min="0";expiryInput.max="3650";expiryInput.step="1";expiryInput.required=true;expiryInput.value=creditDefaults.expiry_days;expiryInput.setAttribute("aria-label",`Credit expiry in days for ${user.username}`);expiryLabel.append(expiryInput);
+    creditButton.type="submit";creditButton.className="secondary";creditButton.textContent="Allocate";creditForm.append(creditLabel,expiryLabel,creditButton);
+    creditForm.addEventListener("submit",async event=>{event.preventDefault();creditButton.disabled=true;try{const result=await request("/api/admin/users/credits",{method:"POST",body:JSON.stringify({username:user.username,amount:Number(creditInput.value),expiry_days:Number(expiryInput.value)})});userFeedback.textContent=`Added credits for ${user.username}; ${result.assignment_credits} assignments are now available.`;await refreshUsers()}catch(error){userFeedback.textContent=error.message}finally{creditButton.disabled=false}});
+    resetForm.className="reset-form";resetLabel.textContent="Set new password";resetInput.type="password";resetInput.name="new_password";resetInput.autocomplete="new-password";resetInput.minLength=10;resetInput.required=true;resetLabel.append(resetInput);
+    resetButton.type="submit";resetButton.className="secondary";resetButton.textContent="Reset password";resetForm.append(resetLabel,resetButton);
+    resetForm.addEventListener("submit",async event=>{event.preventDefault();resetButton.disabled=true;try{await request("/api/admin/users/reset-password",{method:"POST",body:JSON.stringify({username:user.username,new_password:resetInput.value})});resetInput.value="";userFeedback.textContent=`Password reset for ${user.username}; their existing sessions were revoked.`}catch(error){userFeedback.textContent=error.message}finally{resetButton.disabled=false}});
+    profile.append(name,meta,credits,creditForm);card.append(profile,resetForm);usersList.append(card);
+  }
+}
 async function refreshUsers(){try{const data=await request("/api/admin/users");users=data.users;renderUsers()}catch(error){userCount.textContent=error.message}}
+async function refreshDefaults(){try{creditDefaults=await request("/api/admin/credits/defaults");document.querySelector("#default-credit-amount").value=creditDefaults.credits;document.querySelector("#default-credit-expiry").value=creditDefaults.expiry_days;renderUsers()}catch(error){defaultsFeedback.textContent=error.message}}
 async function refreshKeys(){const list=document.querySelector("#keys");try{const data=await request("/api/admin/keys");list.replaceChildren();if(!data.keys.length){const item=document.createElement("li");item.textContent="No keys configured yet.";list.append(item);return}for(const key of data.keys){const item=document.createElement("li"),label=document.createElement("span"),remove=document.createElement("button");label.textContent=`Key ${key.id} · ${key.masked}`;remove.textContent="Remove";remove.className="secondary";remove.addEventListener("click",async()=>{try{await request("/api/admin/keys",{method:"DELETE",body:JSON.stringify({id:key.id})});await refreshKeys()}catch(error){feedback.textContent=error.message}});item.append(label,remove);list.append(item)}}catch(error){feedback.textContent=error.message}}
 document.querySelectorAll(".tab").forEach(tab=>tab.addEventListener("click",()=>{document.querySelectorAll(".tab").forEach(item=>item.setAttribute("aria-selected",String(item===tab)));document.querySelectorAll(".panel").forEach(panel=>panel.hidden=panel.id!==tab.dataset.panel);if(tab.dataset.panel==="keys-panel")refreshKeys()}));
 userSearch.addEventListener("input",renderUsers);
+document.querySelector("#default-credit-form").addEventListener("submit",async event=>{event.preventDefault();const button=event.currentTarget.querySelector("button");button.disabled=true;try{creditDefaults=await request("/api/admin/credits/defaults",{method:"POST",body:JSON.stringify({credits:Number(document.querySelector("#default-credit-amount").value),expiry_days:Number(document.querySelector("#default-credit-expiry").value)})});defaultsFeedback.textContent="New-account defaults saved; existing accounts were not changed.";renderUsers()}catch(error){defaultsFeedback.textContent=error.message}finally{button.disabled=false}});
 document.querySelector("#key-form").addEventListener("submit",async event=>{event.preventDefault();const button=document.querySelector("#save");button.disabled=true;try{await request("/api/admin/keys",{method:"POST",body:JSON.stringify({keys:document.querySelector("#api-keys").value.split(/\r?\n/)})});document.querySelector("#api-keys").value="";feedback.textContent="Keys added.";await refreshKeys()}catch(error){feedback.textContent=error.message}finally{button.disabled=false}});
-document.querySelector("#logout").addEventListener("click",async()=>{await request("/api/auth/logout",{method:"POST",body:"{}"});location.href="/"});refreshUsers();
+document.querySelector("#logout").addEventListener("click",async()=>{await request("/api/auth/logout",{method:"POST",body:"{}"});location.href="/"});refreshDefaults();refreshUsers();
 </script></body></html>"""
 
 PAGE = r"""<!doctype html>
@@ -557,6 +824,7 @@ PAGE = r"""<!doctype html>
     </div>
     <p id="intro">Your study companion. Sign in to the assignment in the browser when prompted.</p>
   </header>
+  <p id="assignment-credit-count" class="hint" hidden></p>
   <section class="card">
     <form id="start-form">
       <label for="url">Assignment URL</label>
@@ -618,6 +886,7 @@ PAGE = r"""<!doctype html>
   const stateLabel = document.querySelector("#state");
   const message = document.querySelector("#message");
   const progress = document.querySelector("#progress");
+  const assignmentCreditCount = document.querySelector("#assignment-credit-count");
   const logs = document.querySelector("#logs");
   let lastLogCount = -1;
   let publicMode = false;
@@ -689,6 +958,11 @@ PAGE = r"""<!doctype html>
       publicMode = Boolean(data.public_mode);
       document.querySelector("#account-name").textContent = data.username || "";
       document.querySelector("#admin-link").hidden = data.role !== "admin";
+      const hasAssignmentCredits = data.role !== "user" || Number(data.assignment_credits) > 0;
+      assignmentCreditCount.hidden = data.role !== "user";
+      assignmentCreditCount.textContent = data.role === "user"
+        ? `Assignments available: ${data.assignment_credits}`
+        : "";
       const state = data.state || "idle";
       lastState = state;
       const active = activeStates.has(state);
@@ -698,7 +972,7 @@ PAGE = r"""<!doctype html>
       progress.textContent = data.question
         ? `Question ${data.question}${data.total ? ` of ${data.total}` : ""}`
         : "";
-      startButton.disabled = active || data.worker_alive || !data.api_key_configured;
+      startButton.disabled = active || data.worker_alive || !data.api_key_configured || !hasAssignmentCredits;
       stopButton.disabled = !active;
       closeButton.disabled = !data.close_available;
       if (data.logs.length !== lastLogCount) {
@@ -714,6 +988,8 @@ PAGE = r"""<!doctype html>
       }
       if (!data.api_key_configured) {
         message.textContent = "The administrator needs to configure an API key before runs can start.";
+      } else if (data.role === "user" && !hasAssignmentCredits) {
+        message.textContent = "No assignments remaining. Contact the administrator for more credits.";
       }
       if (data.public_mode) {
         browserViewCard.style.display = data.live_view_url ? "block" : "none";
@@ -801,6 +1077,8 @@ class RunController:
         api_keys=None,
         browser_context_id=None,
         mobile_number=None,
+        credit_username=None,
+        credit_grant_id=None,
     ):
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -838,6 +1116,8 @@ class RunController:
                     api_keys,
                     browser_context_id,
                     mobile_number,
+                    credit_username,
+                    credit_grant_id,
                 ),
                 name="quiz-runner",
                 daemon=True,
@@ -845,8 +1125,17 @@ class RunController:
             self.worker.start()
 
     def _run(
-        self, url, auto_start, stop_event, api_keys, browser_context_id, mobile_number
+        self,
+        url,
+        auto_start,
+        stop_event,
+        api_keys,
+        browser_context_id,
+        mobile_number,
+        credit_username,
+        credit_grant_id,
     ):
+        credit_consumed = False
         try:
             result = run_automation(
                 url,
@@ -859,6 +1148,7 @@ class RunController:
                 api_keys=api_keys,
                 mobile_number=mobile_number,
             )
+            credit_consumed = result == "awaiting_submission"
             if result == "api_key_rejected":
                 self.report({
                     "status": result,
@@ -879,6 +1169,16 @@ class RunController:
                     "message": str(exc),
                     "live_view_url": "",
                 })
+        finally:
+            if credit_username and not credit_consumed:
+                try:
+                    _refund_assignment_credit(credit_username, credit_grant_id)
+                except Exception as exc:
+                    self.report({
+                        "status": "failed",
+                        "message": f"Could not restore the assignment credit ({type(exc).__name__}); contact the administrator.",
+                        "live_view_url": "",
+                    })
 
     def stop(self):
         with self.lock:
@@ -942,7 +1242,15 @@ class ControllerRegistry:
         return controller.snapshot() if controller else RunController().snapshot()
 
     def start(
-        self, visitor_id, url, auto_start, api_keys, browser_context_id, mobile_number
+        self,
+        visitor_id,
+        url,
+        auto_start,
+        api_keys,
+        browser_context_id,
+        mobile_number,
+        credit_username=None,
+        credit_grant_id=None,
     ):
         with self.lock:
             if not PUBLIC_MODE and self.active_visitor_id:
@@ -971,6 +1279,8 @@ class ControllerRegistry:
                 api_keys=api_keys,
                 browser_context_id=browser_context_id,
                 mobile_number=mobile_number,
+                credit_username=credit_username,
+                credit_grant_id=credit_grant_id,
             )
             if not PUBLIC_MODE:
                 self.active_visitor_id = visitor_id
@@ -1047,6 +1357,22 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._send_json(401, {"error": "Sign in required."})
                 return
             status = CONTROLLERS.snapshot(session["visitor_id"])
+            if session["role"] == "user":
+                with _connect_database() as connection:
+                    row = _execute(
+                        connection,
+                        """
+                        SELECT COALESCE((
+                            SELECT SUM(g.remaining_credits)
+                            FROM assignment_credit_grants g
+                            WHERE g.user_id = u.id AND g.remaining_credits > 0
+                              AND (g.expires_at IS NULL OR g.expires_at > ?)
+                        ), 0) AS assignment_credits
+                        FROM users u WHERE LOWER(u.username) = LOWER(?)
+                        """,
+                        (int(datetime.now().timestamp()), session["username"]),
+                    ).fetchone()
+                status["assignment_credits"] = row["assignment_credits"] if row else 0
             status.update({
                 "username": session["username"],
                 "role": session["role"],
@@ -1059,9 +1385,26 @@ class RequestHandler(BaseHTTPRequestHandler):
             with _connect_database() as connection:
                 rows = _execute(
                     connection,
-                    "SELECT username, date_of_birth, created_at FROM users ORDER BY created_at DESC",
+                    """
+                    SELECT u.username, u.date_of_birth, u.created_at,
+                           COALESCE((
+                               SELECT SUM(g.remaining_credits)
+                               FROM assignment_credit_grants g
+                               WHERE g.user_id = u.id AND g.remaining_credits > 0
+                                 AND (g.expires_at IS NULL OR g.expires_at > ?)
+                           ), 0) AS assignment_credits
+                    FROM users u ORDER BY u.created_at DESC
+                    """,
+                    (int(datetime.now().timestamp()),),
                 ).fetchall()
             self._send_json(200, {"users": [dict(row) for row in rows]})
+            return
+        if path == "/api/admin/credits/defaults":
+            if not self._require_admin(session):
+                return
+            with _connect_database() as connection:
+                settings = _get_default_assignment_settings(connection)
+            self._send_json(200, settings)
             return
         if path == "/api/admin/keys":
             if not self._require_admin(session):
@@ -1175,6 +1518,19 @@ class RequestHandler(BaseHTTPRequestHandler):
                                 secrets.token_urlsafe(24),
                             ),
                         )
+                        user = _execute(
+                            connection,
+                            "SELECT id FROM users WHERE LOWER(username) = LOWER(?)",
+                            (username,),
+                        ).fetchone()
+                        defaults = _get_default_assignment_settings(connection)
+                        if defaults["credits"]:
+                            _insert_assignment_credit_grant(
+                                connection,
+                                user["id"],
+                                defaults["credits"],
+                                defaults["expiry_days"],
+                            )
                         connection.commit()
                 else:
                     with _connect_database() as connection:
@@ -1246,19 +1602,73 @@ class RequestHandler(BaseHTTPRequestHandler):
                 else:
                     self._send_json(200, {"ok": True})
                 return
+            if path == "/api/admin/users/credits":
+                if not self._require_admin(session):
+                    return
+                username = payload.get("username")
+                amount = payload.get("amount")
+                expiry_days = payload.get("expiry_days")
+                if not isinstance(username, str) or not username.strip():
+                    raise ValueError("Select a valid user account.")
+                balance = _add_assignment_credits(
+                    username.strip(), amount, expiry_days
+                )
+                self._send_json(200, {"assignment_credits": balance})
+                return
+            if path == "/api/admin/credits/defaults":
+                if not self._require_admin(session):
+                    return
+                amount = payload.get("credits")
+                expiry_days = payload.get("expiry_days")
+                if (
+                    isinstance(amount, bool)
+                    or not isinstance(amount, int)
+                    or not 0 <= amount <= 10000
+                ):
+                    raise ValueError("Default assignments must be a whole number from 0 to 10,000.")
+                if (
+                    isinstance(expiry_days, bool)
+                    or not isinstance(expiry_days, int)
+                    or not 0 <= expiry_days <= 3650
+                ):
+                    raise ValueError("Expiry must be a whole number from 0 to 3,650 days; use 0 for no expiry.")
+                with _connect_database() as connection:
+                    _set_app_setting(connection, "default_assignment_credits", amount)
+                    _set_app_setting(
+                        connection,
+                        "default_assignment_expiry_days",
+                        expiry_days,
+                    )
+                    connection.commit()
+                self._send_json(
+                    200,
+                    {"credits": amount, "expiry_days": expiry_days},
+                )
+                return
             if path == "/api/start":
                 api_keys = _get_api_keys()
                 mobile_number = payload.get("mobile_number")
                 if mobile_number is not None and not isinstance(mobile_number, str):
                     raise ValueError("Enter a valid phone number.")
-                controller, browser_context_id = CONTROLLERS.start(
-                    session["visitor_id"],
-                    str(payload.get("url", "")).strip(),
-                    bool(payload.get("auto_start", False)),
-                    api_keys,
-                    session["browser_context_id"],
-                    mobile_number,
-                )
+                credit_username = session["username"] if session["role"] == "user" else None
+                credit_grant_id = None
+                if credit_username:
+                    credit_grant_id = _reserve_assignment_credit(credit_username)
+                try:
+                    controller, browser_context_id = CONTROLLERS.start(
+                        session["visitor_id"],
+                        str(payload.get("url", "")).strip(),
+                        bool(payload.get("auto_start", False)),
+                        api_keys,
+                        session["browser_context_id"],
+                        mobile_number,
+                        credit_username=credit_username,
+                        credit_grant_id=credit_grant_id,
+                    )
+                except Exception:
+                    if credit_username:
+                        _refund_assignment_credit(credit_username, credit_grant_id)
+                    raise
                 if browser_context_id != session["browser_context_id"]:
                     with _connect_database() as connection:
                         if session["role"] == "user":
